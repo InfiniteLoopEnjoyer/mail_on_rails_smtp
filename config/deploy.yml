@@ -1,0 +1,77 @@
+<% require "dotenv"; Dotenv.load(".env") %>
+
+# The SMTP daemon as its own Kamal service, deployed independently of the
+# host Rails app: `bin/kamal deploy`. Runs bin/server (MX + submission
+# listeners) with NO Rails and NO database access at all: credential
+# checks, recipient validation, and outbound queueing go to the app's
+# private HTTP API, and accepted inbound mail goes to its Action Mailbox
+# relay ingress. If the app is down, sessions answer temporary failures
+# and sending servers retry.
+#
+# The container holds no RAILS_MASTER_KEY and no database credentials, so
+# it can't reach the app's database or decrypt its credentials even if
+# compromised.
+service: mail_on_rails_smtp
+image: mail_on_rails_smtp
+
+servers:
+  smtp:
+    hosts:
+      - 192.168.0.1
+    # kamal-proxy only speaks HTTP/HTTPS - the listeners publish straight
+    # off the container (host port -> container port; in-container ports
+    # stay >1024 because the image runs as a non-root user). Kamal boots
+    # new before stopping old, which would clash on these ports, so
+    # .kamal/hooks/pre-app-boot stops the old container first (a few
+    # seconds of SMTP downtime per deploy; peers retry).
+    proxy: false
+    options:
+      publish:
+        - "25:1025"    # SMTP MX (inbound mail, STARTTLS)
+        - "587:1587"   # SMTP submission (STARTTLS, AUTH)
+        - "465:1465"   # SMTPS submission (implicit TLS, AUTH)
+
+primary_role: smtp
+
+# Any registry both the build machine and the servers can reach; add
+# username/password entries (resolved via .kamal/secrets-common) if
+# yours requires auth.
+registry:
+  server: registry.example.com
+
+env:
+  secret:
+    # HTTP credentials for the calls to the app, from the gitignored .env
+    # (see .kamal/secrets-common). Deliberately NO RAILS_MASTER_KEY and NO
+    # database env in this container.
+    - MAIL_ON_RAILS_INTERNAL_API_PASSWORD
+    - MAIL_ON_RAILS_INGRESS_PASSWORD
+  clear:
+    # TLS material for the listeners (e.g. Let's Encrypt). Renewals are
+    # picked up live - the servers re-read the files when their mtimes
+    # change (TLS::ContextProvider), no restart needed.
+    MAIL_ON_RAILS_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
+    MAIL_ON_RAILS_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
+
+    # SMTP banner/EHLO name; must match this host's public mail name (and
+    # ideally its PTR record).
+    MAIL_ON_RAILS_HELO_HOST: mail.example.com
+
+    # Accepted inbound mail is POSTed to the app's Action Mailbox relay
+    # ingress; credential/recipient checks and outbound queueing go to the
+    # private API. If the app is down the session answers a temporary
+    # failure and the sending server retries.
+    MAIL_ON_RAILS_INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
+    MAIL_ON_RAILS_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
+
+aliases:
+  logs: app logs -f
+  shell: app exec --interactive --reuse "bash"
+
+volumes:
+  # Mounted at the letsencrypt root (not live/) because live/*.pem are
+  # symlinks into ../../archive/.
+  - "/etc/letsencrypt:/etc/letsencrypt:ro"
+
+builder:
+  arch: amd64
