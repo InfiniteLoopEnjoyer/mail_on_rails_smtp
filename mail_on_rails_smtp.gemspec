@@ -18,7 +18,7 @@ Gem::Specification.new do |spec|
   spec.files = Dir["lib/**/*.rb"] + %w[LICENSE README.md]
   spec.require_paths = [ "lib" ]
 
-  # Used only to parse the From: header for DMARC alignment
-  # (SenderAuth.from_domain).
-  spec.add_dependency "mail", "~> 2.8"
+  # No runtime dependencies: DNS, TLS, verification, and the From: header
+  # parsing (SenderAuth::FromHeader) are all stdlib + hand-rolled, which
+  # also keeps every load path Ractor-safe for the worker Ractors.
 end

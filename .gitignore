@@ -10,3 +10,7 @@
 
 /.bundle/
 /tmp/
+
+# Local clone of swaks (https://github.com/jetmore/swaks) for manual
+# SMTP smoke-testing against the daemon - not part of the gem.
+/swaks/

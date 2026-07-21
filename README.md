@@ -15,6 +15,27 @@ server. `Store::Memory` is the dependency-free reference implementation,
 `Store::Http` the production client, and `Store::Contracts` the
 executable (Minitest) spec a custom store must pass.
 
+## Concurrency architecture
+
+Sessions are served by a pool of **worker Ractors** (one per core by
+default), each running a single thread whose hand-rolled
+**fiber scheduler** (`Smtp::Scheduler`, pure Ruby over `IO.select`)
+multiplexes every session on that worker: socket reads, TLS handshakes,
+DNS lookups, and store HTTP calls park a fiber, never the thread. Accept
+threads stay in the main Ractor with the exact process-wide `ConnLimiter`;
+accepted sockets cross to workers as **raw fd numbers over a control
+pipe** (fds are process-global, and integer messages sidestep Ractor IO
+moves, which Ruby 4.0.6 does not handle reliably under a scheduler -
+probes documented in `scheduler.rb`/`worker.rb`). Finished sessions are
+reported back as single bytes on a shared release pipe.
+
+Ractor mode engages when the store can be rebuilt inside each worker
+(`Store::Http` can - it is env-configured HTTP clients). An injected
+store instance (tests, embedded development) falls back to the same
+worker/scheduler core on plain threads, so both modes exercise identical
+session code. Requires Ruby >= 4.0 in Ractor mode; Ractors are still
+formally experimental there.
+
 Companion repos:
 [mail_on_rails](https://github.com/InfiniteLoopEnjoyer/mail_on_rails)
 (the host Rails app — persistence, internal API, and web UI) and
@@ -24,10 +45,12 @@ Companion repos:
 ## Layout
 
 - `lib/mail_on_rails/smtp/` - the gem: listener scaffolding
-  (`Server`/`ConnLimiter`/`TLS`), the SMTP session (`SmtpServer`),
-  `SenderAuth` (SPF/DKIM/DMARC), and stores (`Store::Memory` reference
-  implementation, `Store::Http` production client, `Store::Contracts`
-  executable contract suite).
+  (`Server`/`ConnLimiter`/`TLS`), the serving core (`Worker` sessions on a
+  hand-rolled fiber `Scheduler`, one worker Ractor per core in
+  production), the SMTP session (`SmtpServer`), `SenderAuth`
+  (SPF/DKIM/DMARC), and stores (`Store::Memory` reference implementation,
+  `Store::Http` production client, `Store::Contracts` executable contract
+  suite).
 - `lib/mail_on_rails/smtp/daemon.rb` - env-driven runtime; also embeddable
   in a host process (e.g. inside Puma in development, passing your own
   store and logger).
@@ -62,15 +85,17 @@ surfaces:
 | `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
 | `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
 | `MAIL_ON_RAILS_SMTP_MAX_CONN` | `100` | Connection cap |
+| `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
+| `MAIL_ON_RAILS_SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
 
 ## Sender verification (SPF / DKIM / DMARC)
 
 Unauthenticated mail arriving on the MX port is verified after `DATA` by
 `SenderAuth` — hand-rolled SPF (RFC 7208), DKIM verification (RFC 6376,
-rsa-sha256 and ed25519-sha256), and DMARC (RFC 7489) on plain `Resolv` +
-OpenSSL. The verdict is stamped as a forge-proof
+rsa-sha256 and ed25519-sha256), and DMARC (RFC 7489) on a hand-rolled DNS
+client + OpenSSL. The verdict is stamped as a forge-proof
 `X-MailOnRails-Auth-Results` header before the message is relayed to the
-host app. Two caveats to know about:
+host app. One caveat to know about:
 
 ### DMARC enforcement is OFF by default
 
@@ -85,17 +110,16 @@ young. Once the logs look right against real traffic, enable rejection with:
 With enforcement on, such messages are refused at SMTP time with
 `550 5.7.1 Rejected per DMARC policy of <domain>`.
 
-### DNS failures fail open
+### DNS
 
-Ruby's `Resolv` cannot distinguish NXDOMAIN from SERVFAIL or a timeout (all
-three surface identically, verified empirically — see
-`lib/mail_on_rails/smtp/sender_auth/dns.rb`). A transient DNS failure
-therefore looks like "no record published": verdicts weaken to `none`
-instead of `temperror`, and mail is accepted rather than tempfailed. That
-is the safe direction while verdicts are recorded rather than enforced,
-but it means a DNS outage temporarily blinds sender verification — worth
-revisiting (e.g. a resolver that speaks DNS directly) before leaning
-harder on enforcement.
+Lookups go straight to the `resolv.conf` nameservers over a hand-rolled
+transport (UDP, TCP retry on truncation) reusing only Ruby `Resolv`'s
+wire codec — plain `Resolv` is not Ractor-safe, and it cannot tell
+NXDOMAIN from SERVFAIL or a timeout. This client can: "no record" returns
+an empty result, while SERVFAIL/timeouts raise `Dns::TempError` and
+verifiers record `temperror` verdicts, so a DNS outage is visible in
+`Authentication-Results` instead of silently weakening every verdict to
+`none`.
 
 ## Test / run
 

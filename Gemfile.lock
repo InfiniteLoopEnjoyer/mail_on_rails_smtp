@@ -2,7 +2,6 @@ PATH
   remote: .
   specs:
     mail_on_rails_smtp (0.1.0)
-      mail (~> 2.8)
 
 GEM
   remote: https://rubygems.org/
@@ -141,6 +140,7 @@ DEPENDENCIES
   dkim
   dotenv
   kamal
+  mail
   mail_on_rails_smtp!
   minitest
   rubocop-rails-omakase

@@ -37,15 +37,17 @@ roadmap yet; see README for the existing roadmap these complement.
 
 ## Architecture (feeds the existing async-IO roadmap item)
 
-- [ ] **Evaluate nio4r reactor vs fiber scheduler** — Postal's SMTP
-  server is a single-threaded `NIO::Selector` reactor with per-connection
-  state stashed in `monitor.value` (`server.rb:97-296`): a working,
-  readable alternative to the `async`-gem route in our README roadmap.
-  Its **non-blocking STARTTLS handshake** (`accept_nonblock` retried via
-  `WaitReadable`/`WaitWritable` through the event loop, `server.rb:167-182`)
-  is the reference for the hardest part. Caveat noted from their design:
-  a single reactor turns any blocking call (DNS! tarpit sleeps!) into a
-  full-server stall, so this only pans out together with async DNS.
+- [x] **Evaluate nio4r reactor vs fiber scheduler** — RESOLVED
+  (2026-07-21): went with a hand-rolled fiber scheduler (pure Ruby over
+  `IO.select`, `smtp/scheduler.rb`) inside worker Ractors (one per core,
+  `smtp/worker.rb`), fd-passing over control pipes from the accept
+  threads. Postal's single-reactor stall caveat is addressed twice over:
+  blocking calls only stall one worker's fibers, and the DNS layer was
+  rewritten (own UDP/TCP transport) because `Resolv` is not Ractor-safe
+  anyway. STARTTLS handshakes run non-blocking under the scheduler via
+  OpenSSL's scheduler-aware IO waits — no hand-rolled retry loop needed.
+  The `mail` gem runtime dependency fell out too (not Ractor-safe;
+  `SenderAuth::FromHeader` replaces it).
 - [ ] **`@proc` continuation pattern for multi-line states** — Postal
   models DATA and AUTH challenge/response by swapping the line handler
   (`client.rb:409-462`) instead of flag-checking in a big dispatch. Tidy

@@ -1,8 +1,7 @@
 # frozen_string_literal: true
 
-require "mail"
-
 require_relative "sender_auth/dns"
+require_relative "sender_auth/from_header"
 require_relative "sender_auth/spf"
 require_relative "sender_auth/dkim"
 require_relative "sender_auth/dmarc"
@@ -69,12 +68,7 @@ module MailOnRails
       # unparseable, or not exactly one address (DMARC has no defined
       # verdict there, and nil makes evaluate return permerror).
       def self.from_domain(data)
-        header_block = data.to_s.gsub(/(?<!\r)\n/, "\r\n").partition("\r\n\r\n").first
-        mail = Mail.read_from_string(header_block + "\r\n\r\n")
-        addresses = Array(mail.from)
-        return nil unless addresses.size == 1
-
-        addresses.first.to_s.split("@").last&.downcase
+        FromHeader.domain(data)
       rescue StandardError
         nil
       end

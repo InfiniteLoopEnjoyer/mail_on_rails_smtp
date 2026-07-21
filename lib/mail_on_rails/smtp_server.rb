@@ -37,9 +37,7 @@ module MailOnRails
 
     def listener_label(spec) = "#{spec[:port]}/#{spec[:tls]}/#{spec[:role]}"
 
-    def new_session(socket, spec, ctx)
-      Session.new(socket, @store, spec, ctx)
-    end
+    def session_class = Session
 
     class Session
       include Smtp::SessionHelpers

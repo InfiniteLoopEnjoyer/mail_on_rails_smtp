@@ -9,6 +9,10 @@ group :development do
   # Signs test fixtures so the DKIM verifier has something real to check.
   gem "dkim"
 
+  # No longer a runtime dependency (SenderAuth::FromHeader replaced it);
+  # kept in tests as the reference to parity-check the From: parser against.
+  gem "mail"
+
   # Deploy this daemon as a Docker container (config/deploy.yml). Kamal
   # brings dotenv, which the deploy config uses to load .env for secrets.
   gem "kamal", require: false
