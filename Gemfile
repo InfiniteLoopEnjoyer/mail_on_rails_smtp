@@ -1,6 +1,6 @@
 source "https://rubygems.org"
 
-# Runtime dependencies live in the gemspec (just `mail`).
+# Runtime dependencies live in the gemspec (currently none).
 gemspec
 
 group :development do
