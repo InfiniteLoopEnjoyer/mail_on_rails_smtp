@@ -16,4 +16,7 @@ group :development do
 
   # Omakase Ruby styling [https://github.com/rails/rubocop-rails-omakase/]
   gem "rubocop-rails-omakase", require: false
+
+  # Scans the bundle for gems with known CVEs (`bundle exec bundler-audit check --update`).
+  gem "bundler-audit", require: false
 end

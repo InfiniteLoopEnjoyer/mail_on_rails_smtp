@@ -15,6 +15,12 @@ server. `Store::Memory` is the dependency-free reference implementation,
 `Store::Http` the production client, and `Store::Contracts` the
 executable (Minitest) spec a custom store must pass.
 
+Companion repos:
+[mail_on_rails](https://github.com/InfiniteLoopEnjoyer/mail_on_rails)
+(the host Rails app — persistence, internal API, and web UI) and
+[mail_on_rails_imap](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_imap)
+(the IMAP server).
+
 ## Layout
 
 - `lib/mail_on_rails/smtp/` - the gem: listener scaffolding
