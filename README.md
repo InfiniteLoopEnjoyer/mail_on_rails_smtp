@@ -87,6 +87,7 @@ surfaces:
 | `MAIL_ON_RAILS_SMTP_MAX_CONN` | `100` | Connection cap |
 | `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
 | `MAIL_ON_RAILS_SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
+| `MAIL_ON_RAILS_SMTP_TRACE` | off | `1` debug-logs the protocol exchange (credentials redacted, DATA payloads omitted) |
 
 ## Sender verification (SPF / DKIM / DMARC)
 

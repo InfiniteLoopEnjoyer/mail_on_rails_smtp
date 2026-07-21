@@ -34,6 +34,14 @@ module MailOnRails
     # protocol_name, busy_line (sent when the connection cap is hit),
     # listener_label(spec) and session_class.
     class Server
+      # Reap dead peers at the TCP layer (Postal's timings): first probe
+      # after 50s idle, then every 10s, gone after 5 unanswered probes -
+      # ~100s to reclaim a half-open connection's ConnLimiter slot instead
+      # of waiting out the sessions' 300s idle timeout.
+      KEEPALIVE_IDLE = 50
+      KEEPALIVE_INTERVAL = 10
+      KEEPALIVE_PROBES = 5
+
       def self.run(store, listeners, tls_material, workers: nil)
         new(store, listeners, tls_material, workers: workers).run
       end
@@ -83,7 +91,7 @@ module MailOnRails
       # can cross into worker Ractors.
       def build_session_specs
         @listeners.map do |spec|
-          Ractor.make_shareable(spec.slice(:host, :port, :tls, :role, :hostname))
+          Ractor.make_shareable(spec.slice(:host, :port, :tls, :role, :hostname, :trace))
         end
       end
 
@@ -127,6 +135,7 @@ module MailOnRails
         server = spec[:tcp_server] || TCPServer.new(spec[:host], spec[:port])
         loop do
           socket = server.accept
+          tune_keepalive(socket)
           if @limiter.acquire
             dispatch(socket, session_spec, spec_index)
           else
@@ -157,6 +166,17 @@ module MailOnRails
         rescue StandardError
           nil
         end
+      end
+
+      # TCP_KEEP* constants are platform-dependent (macOS has no
+      # TCP_KEEPIDLE); missing ones just mean kernel-default timings.
+      def tune_keepalive(socket)
+        socket.setsockopt(:SOCKET, :KEEPALIVE, true)
+        socket.setsockopt(:TCP, :KEEPIDLE, KEEPALIVE_IDLE) if Socket.const_defined?(:TCP_KEEPIDLE)
+        socket.setsockopt(:TCP, :KEEPINTVL, KEEPALIVE_INTERVAL) if Socket.const_defined?(:TCP_KEEPINTVL)
+        socket.setsockopt(:TCP, :KEEPCNT, KEEPALIVE_PROBES) if Socket.const_defined?(:TCP_KEEPCNT)
+      rescue SystemCallError
+        nil
       end
 
       def reject_busy(socket)

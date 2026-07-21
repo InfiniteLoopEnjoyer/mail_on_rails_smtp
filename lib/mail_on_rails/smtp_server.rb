@@ -24,10 +24,15 @@ module MailOnRails
   class SmtpServer < Smtp::Server
     MAX_MESSAGE_BYTES = 25 * 1024 * 1024
     MAX_LINE = 4096
+    MAX_RECEIVED_HOPS = 4
     MAX_RECIPIENTS = 100
     MAX_MESSAGES_PER_SESSION = 100
     MAX_AUTH_ATTEMPTS = 3
     MAX_CONNECTIONS = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_MAX_CONN", 100))
+    # Protocol tracing default; per-listener spec[:trace] overrides. Read at
+    # load time because worker Ractors cannot access ENV.
+    TRACE_DEFAULT = ENV["MAIL_ON_RAILS_SMTP_TRACE"] == "1"
+    LOG_REDACTION = "[redacted]"
 
     private
 
@@ -48,18 +53,22 @@ module MailOnRails
         @spec = spec
         @tls_ctx = tls_ctx
         @tls = spec[:tls] == :implicit
+        @trace = spec.fetch(:trace, TRACE_DEFAULT)
         @authenticated_as = nil
         @auth_attempts = 0
         @message_count = 0
+        @continuation = nil
         reset
       end
 
       def run
         set_timeout(300)
         reply 220, "#{server_name} ESMTP mail_on_rails service ready"
-        while (line = read_line)
-          break if handle_command(line) == :quit
+        while (chunk = @socket.gets("\r\n", MAX_LINE))
+          break if handle_chunk(chunk) == :quit
         end
+        # EOF with a continuation active means the peer vanished mid-DATA
+        # or mid-AUTH; nothing has been stored, so ending here aborts it.
       rescue IOError, SystemCallError, IO::TimeoutError, OpenSSL::SSL::SSLError
         # client went away
       rescue StandardError => e
@@ -75,21 +84,52 @@ module MailOnRails
         @rcpt_to = []
       end
 
-      # -- transport ---------------------------------------------------------
-
-      def read_line
-        line = @socket.gets("\r\n", MAX_LINE)
-        return nil if line.nil?
-        # A line longer than MAX_LINE comes back without its terminator.
-        return "" unless line.end_with?("\r\n")
-
-        line.chomp
-      end
-
       def close_socket
         @socket.close
       rescue StandardError
         nil
+      end
+
+      # -- input handling ----------------------------------------------------
+      #
+      # The run loop above is the only read site. Each chunk is one
+      # MAX_LINE-capped gets("\r\n") result: normally a full CRLF line, but
+      # an overlong line arrives split with no terminator. Multi-line states
+      # (DATA payload, AUTH challenge/response) install @continuation, which
+      # then receives the raw chunks instead of the command dispatch and
+      # clears itself when its exchange completes - Postal's @proc pattern.
+
+      def handle_chunk(chunk)
+        return @continuation.call(chunk) if @continuation
+
+        line = line_from(chunk)
+        trace "<= #{redact_for_trace(line)}"
+        handle_command(line)
+      end
+
+      # A chunk without its CRLF is an overlong command line; normalize to
+      # "" so dispatch rejects it rather than acting on a truncated command.
+      def line_from(chunk)
+        chunk.end_with?("\r\n") ? chunk.delete_suffix("\r\n") : ""
+      end
+
+      # -- protocol tracing --------------------------------------------------
+      #
+      # Debug-level log of the command/reply exchange, for diagnosing broken
+      # peers. Credentials never reach the log: AUTH arguments are redacted
+      # here, AUTH challenge responses are logged as a placeholder at the
+      # challenge chokepoint, and DATA payloads bypass tracing entirely
+      # (continuation chunks are never traced).
+
+      def trace(message)
+        @store.log(:debug, "SMTP #{message} (#{peer_ip})") if @trace
+      end
+
+      # An AUTH argument is an initial response - PLAIN's carries the
+      # password, LOGIN's the username - so drop everything after the
+      # mechanism (Postal's sanitize_input_for_log).
+      def redact_for_trace(line)
+        line.sub(/\A(AUTH[ \t]+\S+)[ \t].*/i) { "#{Regexp.last_match(1)} #{LOG_REDACTION}" }
       end
 
       # -- command dispatch --------------------------------------------------
@@ -117,8 +157,14 @@ module MailOnRails
         @spec[:hostname] || "mail_on_rails"
       end
 
+      # Overridable via spec so tests can exercise size handling without
+      # shoveling 25 MB through a loopback socket.
+      def max_message_bytes
+        @spec[:max_message_bytes] || MAX_MESSAGE_BYTES
+      end
+
       def ehlo(arg)
-        extensions = [ "#{server_name} greets #{arg}", "SIZE #{MAX_MESSAGE_BYTES}", "8BITMIME", "PIPELINING" ]
+        extensions = [ "#{server_name} greets #{arg}", "SIZE #{max_message_bytes}", "8BITMIME", "PIPELINING" ]
         extensions << "STARTTLS" if @tls_ctx && !@tls
         extensions << "AUTH PLAIN LOGIN" if auth_offered?
         multi 250, extensions
@@ -153,23 +199,37 @@ module MailOnRails
         mechanism, initial = arg.to_s.split(" ", 2)
         case mechanism&.upcase
         when "PLAIN"
-          initial ||= challenge("")
-          return reply 501, "Cancelled" if initial == "*"
-
-          _authzid, user, pass = (decode_sasl_plain(initial) rescue [])
-          verify_credentials(user, pass)
+          initial ? auth_plain(initial) : challenge("") { |response| auth_plain(response) }
         when "LOGIN"
-          user = decode64(initial || challenge("VXNlcm5hbWU6"))
-          pass = decode64(challenge("UGFzc3dvcmQ6"))
-          verify_credentials(user, pass)
+          if initial
+            challenge("UGFzc3dvcmQ6") { |pass| verify_credentials(decode64(initial), decode64(pass)) }
+          else
+            challenge("VXNlcm5hbWU6") do |user|
+              challenge("UGFzc3dvcmQ6") { |pass| verify_credentials(decode64(user), decode64(pass)) }
+            end
+          end
         else
           reply 504, "Unrecognized authentication type"
         end
       end
 
-      def challenge(prompt)
-        @socket.write("334 #{prompt}\r\n")
-        read_line.to_s
+      def auth_plain(response)
+        _authzid, user, pass = (decode_sasl_plain(response) rescue [])
+        verify_credentials(user, pass)
+      end
+
+      # RFC 4954 challenge: send 334 and hand the client's next line to the
+      # block. A lone "*" cancels the exchange (uniformly, for every prompt).
+      # The response is a credential, so the trace gets a placeholder.
+      def challenge(prompt, &handler)
+        reply 334, prompt
+        @continuation = proc do |chunk|
+          @continuation = nil
+          line = line_from(chunk)
+          trace "<= #{line == "*" ? line : LOG_REDACTION}"
+          line == "*" ? reply(501, "Cancelled") : handler.call(line)
+        end
+        nil
       end
 
       def decode64(str)
@@ -256,8 +316,70 @@ module MailOnRails
         end
 
         reply 354, "End data with <CR><LF>.<CR><LF>"
-        body = read_data_body
-        return reply 552, "Message exceeds maximum size" unless body
+        @continuation = data_continuation
+      end
+
+      # Consumes the DATA payload one chunk at a time through the
+      # terminating <CRLF>.<CRLF>. Chunks are MAX_LINE-capped, so a peer
+      # that never sends CRLF cannot grow a single read without bound, and
+      # line boundaries are tracked across chunk splits so the terminator
+      # and dot-unstuffing apply only at true line starts - a bare-LF "."
+      # line never ends DATA (SMTP smuggling).
+      #
+      # Over max_message_bytes the payload is discarded but still consumed
+      # to stay in sync, then answered 552 at the terminator; past twice
+      # the limit we stop reading mid-message, so the connection must drop
+      # (:quit). A disconnect mid-payload just ends the run loop with the
+      # continuation still installed - the partial body is never stored.
+      def data_continuation
+        body = +"".b
+        consumed = 0
+        line_start = true    # next chunk begins a fresh line
+        dangling_cr = false  # previous chunk was cut just after a "\r"
+        proc do |chunk|
+          if dangling_cr && chunk.start_with?("\n")
+            # A CRLF split across the chunk cap: this LF completes the line.
+            consumed += 1
+            body << "\n" if consumed <= max_message_bytes
+            chunk = chunk[1..]
+            line_start = true
+            dangling_cr = false
+            next if chunk.empty?
+          end
+          if line_start
+            if chunk == ".\r\n"
+              @continuation = nil
+              next finish_data(consumed > max_message_bytes ? :overflow : body)
+            end
+            chunk = chunk[1..] if chunk.start_with?(".") # undo dot-stuffing
+          end
+          line_start = chunk.end_with?("\r\n")
+          dangling_cr = !line_start && chunk.end_with?("\r")
+          consumed += chunk.bytesize
+          if consumed > max_message_bytes * 2
+            @store.log(:warn, "SMTP message from <#{@mail_from}> refused: exceeds #{max_message_bytes} bytes (#{peer_ip})")
+            reply 552, "Message exceeds maximum size"
+            next :quit # peer kept flooding past the size limit
+          end
+          body << chunk if consumed <= max_message_bytes
+          nil
+        end
+      end
+
+      def finish_data(body)
+        unless body.is_a?(String) # :overflow
+          @store.log(:warn, "SMTP message from <#{@mail_from}> refused: exceeds #{max_message_bytes} bytes (#{peer_ip})")
+          reply 552, "Message exceeds maximum size"
+          reset
+          return
+        end
+
+        if received_loop?(body)
+          @store.log(:warn, "SMTP rejected message from <#{@mail_from}>: mail loop detected (#{peer_ip})")
+          reply 550, "Loop detected"
+          reset
+          return
+        end
 
         auth_results = nil
         if @spec[:role] == :mx && !@authenticated_as
@@ -309,28 +431,29 @@ module MailOnRails
         @rcpt_to.size > 3 ? "#{shown} +#{@rcpt_to.size - 3} more" : shown
       end
 
-      def read_data_body
-        body = +"".b
-        overflow = false
-        while (line = @socket.gets("\r\n"))
-          break if line == ".\r\n"
-
-          line = line[1..] if line.start_with?(".") # undo dot-stuffing
-          overflow ||= body.bytesize + line.bytesize > MAX_MESSAGE_BYTES
-          body << line unless overflow
+      # Postal-style mail loop detection: a message whose headers show it
+      # already passed through this host more than MAX_RECEIVED_HOPS times
+      # is looping between forwarders.
+      def received_loop?(body)
+        header_section = body.split("\r\n\r\n", 2).first.to_s
+        hostname = server_name.downcase
+        hops = header_section.split(/\r\n(?![ \t])/).count do |header|
+          header.match?(/\AReceived:/i) && header.downcase.include?(hostname)
         end
-        overflow ? nil : body
+        hops > MAX_RECEIVED_HOPS
       end
 
       # -- replies -----------------------------------------------------------
 
       def reply(code, text)
+        trace "=> #{code} #{text}"
         @socket.write("#{code} #{text}\r\n")
       end
 
       def multi(code, lines)
         lines.each_with_index do |text, i|
           separator = i == lines.length - 1 ? " " : "-"
+          trace "=> #{code}#{separator}#{text}"
           @socket.write("#{code}#{separator}#{text}\r\n")
         end
       end

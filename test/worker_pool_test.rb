@@ -184,6 +184,25 @@ class WorkerPoolTest < Minitest::Test
     assert wait_for_free_slot(spec), "slot was not released after QUIT"
   end
 
+  def test_accepted_sockets_get_keepalive_tuning
+    server = MailOnRails::SmtpServer.new(memory_store, [], nil)
+    listener = TCPServer.new("127.0.0.1", 0)
+    @cleanup << -> { listener.close rescue nil }
+    client = TCPSocket.new("127.0.0.1", listener.addr[1])
+    @cleanup << -> { client.close rescue nil }
+    accepted = listener.accept
+    @cleanup << -> { accepted.close rescue nil }
+
+    server.send(:tune_keepalive, accepted)
+
+    assert_predicate accepted.getsockopt(:SOCKET, :KEEPALIVE), :bool
+    skip "no TCP_KEEP* constants on this platform" unless Socket.const_defined?(:TCP_KEEPIDLE)
+
+    assert_equal MailOnRails::Smtp::Server::KEEPALIVE_IDLE, accepted.getsockopt(:TCP, :KEEPIDLE).int
+    assert_equal MailOnRails::Smtp::Server::KEEPALIVE_INTERVAL, accepted.getsockopt(:TCP, :KEEPINTVL).int
+    assert_equal MailOnRails::Smtp::Server::KEEPALIVE_PROBES, accepted.getsockopt(:TCP, :KEEPCNT).int
+  end
+
   # -- Ractor mode ---------------------------------------------------------
 
   def test_ractor_mode_serves_protocol_from_worker_ractors
