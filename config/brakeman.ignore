@@ -1,0 +1,26 @@
+{
+  "ignored_warnings": [
+    {
+      "warning_type": "SSL Verification Bypass",
+      "warning_code": 71,
+      "fingerprint": "7d5f84d2f5bc2c385e9250b7cbc04ee4ef0d9268ca73e6dd7b9700059579c45d",
+      "check_name": "SSLVerify",
+      "message": "SSL certificate verification was bypassed",
+      "file": "lib/mail_on_rails/smtp/tls.rb",
+      "line": 126,
+      "link": "https://brakemanscanner.org/docs/warning_types/ssl_verification_bypass/",
+      "code": "OpenSSL::SSL::SSLContext.new.verify_mode = OpenSSL::SSL::VERIFY_NONE",
+      "render_path": null,
+      "location": {
+        "type": "method",
+        "class": "MailOnRails::Smtp::TLS",
+        "method": "context"
+      },
+      "user_input": null,
+      "confidence": "High",
+      "note": "False positive: this is a server-side SSLContext for accepted SMTP connections. verify_mode here controls client-certificate (mTLS) verification, which SMTP clients never present; it does not disable verification of any remote peer. All outbound HTTP/TLS clients verify normally."
+    }
+  ],
+  "updated": "2026-07-22",
+  "brakeman_version": "8.0.5"
+}
