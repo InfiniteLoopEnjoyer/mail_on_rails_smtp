@@ -18,29 +18,50 @@ module MailOnRails
     # ContextProvider); a single context instance is safely shared by that
     # server's connection threads.
     module TLS
+      # Configuration error in explicitly-provided TLS material. Fatal at
+      # boot: a mail host that silently degrades to plaintext-only looks
+      # healthy while refusing STARTTLS, SMTPS, and (since AUTH requires an
+      # encrypted channel) all submission.
+      class Error < StandardError; end
+
       module_function
 
       # Returns TLS material (a Hash of plain strings) or nil if TLS can't be
       # provisioned. When MAIL_ON_RAILS_TLS_CERT/KEY are set, returns
       # { cert_path:, key_path: } so each server re-reads the files when the
-      # cert is renewed (see ContextProvider); otherwise generates/loads a
-      # self-signed cert under +dir+ and returns its PEMs inline as
-      # { cert:, key: }. +dir+ and +logger+ are injected by the caller so this
-      # module stays free of Rails (the store contract in the main
-      # mail_on_rails app repo follows the same principle on the storage side).
+      # cert is renewed (see ContextProvider) - and raises Error when they
+      # are missing or unusable: explicitly configured TLS must never
+      # degrade to plaintext. Without them, generates/loads a self-signed
+      # cert under +dir+ and returns its PEMs inline as { cert:, key: }, or
+      # nil if that fails (forgiving by design - it is the development
+      # path). +dir+ and +logger+ are injected by the caller so this module
+      # stays free of Rails (the store contract in the main mail_on_rails
+      # app repo follows the same principle on the storage side).
       def material(dir: nil, logger: nil)
         cert_path = ENV["MAIL_ON_RAILS_TLS_CERT"]
         key_path = ENV["MAIL_ON_RAILS_TLS_KEY"]
+        return explicit_material(cert_path, key_path) if cert_path || key_path
 
-        if cert_path && key_path
-          context(cert: File.read(cert_path), key: File.read(key_path)) # fail at boot, not first connection
-          { cert_path: cert_path, key_path: key_path }
-        else
+        begin
           load_or_generate_self_signed(dir, logger)
+        rescue StandardError => e
+          logger&.error "[mail_on_rails] TLS material unavailable: #{e.class}: #{e.message}"
+          nil
         end
-      rescue StandardError => e
-        logger&.error "[mail_on_rails] TLS material unavailable: #{e.class}: #{e.message}"
-        nil
+      end
+
+      # Explicit cert/key configuration: any problem is a fatal Error.
+      def explicit_material(cert_path, key_path)
+        unless cert_path && key_path
+          raise Error, "MAIL_ON_RAILS_TLS_CERT and MAIL_ON_RAILS_TLS_KEY must be set together"
+        end
+
+        begin
+          context(cert: File.read(cert_path), key: File.read(key_path)) # verify at boot, not first connection
+        rescue StandardError => e
+          raise Error, "TLS material #{cert_path} / #{key_path} unusable: #{e.class}: #{e.message}"
+        end
+        { cert_path: cert_path, key_path: key_path }
       end
 
       def load_or_generate_self_signed(dir, logger)

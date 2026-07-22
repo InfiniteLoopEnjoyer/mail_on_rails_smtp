@@ -30,6 +30,14 @@ module MailOnRails
     #   injected (tests, embedded development) - an in-process store can't
     #   be rebuilt inside a Ractor.
     class Worker
+      # Cap on the implicit-TLS handshake. The session's own idle timeout is
+      # only set once the session runs - after TLS.accept - so without this
+      # bound a connected-but-silent peer parks the handshake fiber forever
+      # and its ConnLimiter slot leaks (TCP keepalive only reaps dead peers,
+      # not alive-and-idle ones). Overridable per listener via
+      # spec[:handshake_timeout].
+      HANDSHAKE_TIMEOUT = 30
+
       def initialize(store:, session_class:, tls: nil, on_done: nil)
         @store = store
         @session_class = session_class
@@ -98,7 +106,10 @@ module MailOnRails
 
       def handle(socket, spec)
         ctx = @tls&.context
-        socket = TLS.accept(socket, ctx) if spec[:tls] == :implicit && ctx
+        if spec[:tls] == :implicit && ctx
+          socket.timeout = spec[:handshake_timeout] || HANDSHAKE_TIMEOUT if socket.respond_to?(:timeout=)
+          socket = TLS.accept(socket, ctx)
+        end
         @session_class.new(socket, @store, spec, ctx).run
       rescue OpenSSL::SSL::SSLError, IOError, SystemCallError
         nil # session logs its own protocol-level errors; this is connection debris

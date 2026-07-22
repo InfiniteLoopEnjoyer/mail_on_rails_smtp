@@ -81,7 +81,7 @@ surfaces:
 | `MAIL_ON_RAILS_HOST` | `0.0.0.0` | Bind address |
 | `MAIL_ON_RAILS_SMTP_PORT` / `_SMTP_SUBMISSION_PORT` / `_SMTPS_PORT` | `1025` / `1587` / `1465` | Listener ports |
 | `MAIL_ON_RAILS_HELO_HOST` | hostname | Banner/EHLO name |
-| `MAIL_ON_RAILS_TLS_CERT` / `_TLS_KEY` | - | PEM paths (else self-signed under `MAIL_ON_RAILS_TLS_DIR`, default `storage/tls`) |
+| `MAIL_ON_RAILS_TLS_CERT` / `_TLS_KEY` | - | PEM paths; if set but missing/unloadable the daemon refuses to boot (else self-signed under `MAIL_ON_RAILS_TLS_DIR`, default `storage/tls`) |
 | `MAIL_ON_RAILS_TLS_HOSTS` | `localhost` | Comma-separated SANs for the self-signed cert (hostname is always added) |
 | `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
 | `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |

@@ -45,12 +45,12 @@ class WorkerPoolTest < Minitest::Test
 
   # Boots a server on ephemeral loopback ports (pre-bound listeners via the
   # spec[:tcp_server] seam) and returns the specs with ports filled in.
-  def start_server(store, roles:, tls_material: nil, workers: 2, server_class: MailOnRails::SmtpServer)
+  def start_server(store, roles:, tls_material: nil, workers: 2, server_class: MailOnRails::SmtpServer, spec_extra: {})
     specs = roles.map do |role, tls|
       listener = TCPServer.new("127.0.0.1", 0)
       @cleanup << -> { listener.close rescue nil }
       { host: "127.0.0.1", port: listener.addr[1], tls: tls, role: role,
-        hostname: "mx.test", tcp_server: listener }
+        hostname: "mx.test", tcp_server: listener }.merge(spec_extra)
     end
     thread = Thread.new { server_class.run(store, specs, tls_material, workers: workers) }
     @cleanup << -> { thread.kill }
@@ -184,6 +184,27 @@ class WorkerPoolTest < Minitest::Test
     assert wait_for_free_slot(spec), "slot was not released after QUIT"
   end
 
+  # A peer that connects to the implicit-TLS port and never speaks must not
+  # hold its connection slot past the handshake timeout (TCP keepalive only
+  # reaps dead peers; this one stays alive and silent).
+  def test_implicit_tls_handshake_timeout_frees_the_slot
+    spec = start_server(memory_store, roles: [ [ :submission, :implicit ] ],
+                        tls_material: tls_material, server_class: TinyServer,
+                        spec_extra: { handshake_timeout: 0.3 }).first
+
+    silent = connect(spec) # occupies the only slot, never starts TLS
+
+    # The server must close the stalled connection (EOF or reset)...
+    begin
+      assert_nil silent.gets("\r\n"), "server should close a stalled handshake"
+    rescue SystemCallError
+      # a reset also proves the close
+    end
+
+    # ...and release its slot so a well-behaved TLS client gets through.
+    assert wait_for_free_tls_slot(spec), "stalled handshake did not release its slot"
+  end
+
   def test_accepted_sockets_get_keepalive_tuning
     server = MailOnRails::SmtpServer.new(memory_store, [], nil)
     listener = TCPServer.new("127.0.0.1", 0)
@@ -236,6 +257,29 @@ class WorkerPoolTest < Minitest::Test
   end
 
   private
+
+  # Polls until a full TLS handshake + 220 banner succeeds. While the slot
+  # is still held, the 421 busy line arrives as plaintext and fails the
+  # client-side handshake with an SSLError.
+  def wait_for_free_tls_slot(spec)
+    40.times do
+      begin
+        client = connect(spec)
+        ctx = OpenSSL::SSL::SSLContext.new
+        ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
+        tls = OpenSSL::SSL::SSLSocket.new(client, ctx)
+        tls.sync_close = true
+        tls.connect
+        reply = read_reply(tls)
+        tls.close
+        return true if reply.start_with?("220")
+      rescue OpenSSL::SSL::SSLError, SystemCallError, IO::TimeoutError
+        nil
+      end
+      sleep 0.05
+    end
+    false
+  end
 
   # QUIT's release is asynchronous to the client seeing "221"; poll briefly.
   def wait_for_free_slot(spec)

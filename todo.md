@@ -1,327 +1,426 @@
 # TODO
 
-This document tracks high-impact reliability, security, and feature work needed to move `mail_on_rails_smtp` from early-stage to production-grade operation.
+Reliability, security, and feature work for `mail_on_rails_smtp`.
+
+> **Re-triaged 2026-07-22** after a full read of `lib/` and `test/`. The original
+> 20-item list read as a generic "production MTA" checklist; this revision grounds
+> each item against what the code and tests actually do. Original item numbers are
+> kept in parentheses for traceability. Headline changes:
+>
+> - **Several items were already done or nearly done** (DNS failure harness,
+>   outbound-scope docs, HTTP-store error-envelope basics).
+> - **Several items belong to the host Rails app, not this daemon** — this daemon
+>   deliberately has no queue, no database, and no policy store. Queue durability,
+>   dead-lettering, spam scanning, tenant policy, and outbound DKIM are the app's
+>   concerns (or moot).
+> - **Four concrete, code-level gaps surfaced during the read** that outrank most
+>   of the original list. They are now items N1–N4.
 
 ## Priority guide
 
 - **P0**: Required before broad production rollout
 - **P1**: Strongly recommended for production hardening
-- **P2**: Important enhancements for scale, operability, and future-proofing
+- **P2**: Nice to have; small docs/tests
 
 ---
 
-## A) Test coverage gaps / failure modes
+## New findings from the code read (not in the original list)
 
-### 1) Real network/DNS failure behavior (integration) — **P0**
-**Why needed**
-- Sender auth correctness depends on DNS under real network conditions.
-- Unit tests with `FakeResolver` are good for logic, but they cannot prove behavior under resolver timeouts, truncation, or SERVFAIL storms.
+### N1) Implicit-TLS handshake has no timeout — **P0 — DONE 2026-07-22** *(found while assessing #2)*
 
-**Brief plan**
-- Add an integration DNS harness with controllable responses (timeouts, truncation, malformed packets, NXDOMAIN/SERVFAIL).
-- Add tests for UDP->TCP fallback and timeout boundaries.
-- Assert exact SMTP outcomes (`4xx` tempfail vs `5xx` permfail) and auth-results stamping.
+> **Resolved:** `Worker#handle` now sets a 30 s IO timeout (`HANDSHAKE_TIMEOUT`,
+> overridable via `spec[:handshake_timeout]`) on the raw socket before
+> `TLS.accept`; the scheduler's `io.timeout` handling raises `IO::TimeoutError`
+> into the parked fiber, and the existing `IOError` rescue closes the socket and
+> releases the slot. Validated by
+> `test_implicit_tls_handshake_timeout_frees_the_slot` in
+> `worker_pool_test.rb` (confirmed to fail against the unfixed code).
+**What the code does today**
+- Port 465 (`tls: :implicit`): `Worker#handle` calls `TLS.accept` **before** the
+  session runs, so `set_timeout(300)` has not happened yet. The raw socket's
+  `IO#timeout` is nil, and `Scheduler#io_wait` only arms an idle timer when
+  `io.timeout` is set. A client that connects and sends nothing (or stalls
+  mid-handshake) parks a fiber **forever** and holds a `ConnLimiter` slot
+  indefinitely. TCP keepalive only reaps *dead* peers, not alive-and-silent ones —
+  100 such connections take the server offline for the cost of 100 idle sockets.
+- The STARTTLS path (25/587) is bounded: the 300 s idle timeout is set at session
+  start, before the upgrade handshake reads.
 
-**Suggested deliverables**
-- `test/integration/dns_integration_test.rb`
-- Fixtures for DNS failure scenarios.
+**Plan**
+- Set an IO timeout on the accepted socket before the implicit-TLS handshake (in
+  `Worker#handle` or at accept time), shorter than the session idle timeout —
+  30–60 s is conventional for a handshake.
+- Test: connect to an implicit-TLS listener, send nothing, assert the slot is
+  released within the bound (loopback, short spec-injected timeout).
 
----
-
-### 2) TLS certificate/handshake failure cases — **P0**
-**Why needed**
-- TLS failures are common in production and can become silent reliability or security regressions.
-- Current coverage appears focused on happy paths.
-
-**Brief plan**
-- Add tests for expired certs, bad SAN/CN, invalid chain, unsupported ciphers/protocol versions, and mid-handshake disconnects.
-- Validate clear SMTP responses and connection teardown behavior.
-
-**Suggested deliverables**
-- `test/tls_failure_test.rb`
-- Scripted cert fixture generator under `test/fixtures/tls/`.
-
----
-
-### 3) HTTP store failure taxonomy — **P0**
-**Why needed**
-- The SMTP daemon depends on internal API + ingress availability.
-- Network and HTTP failure mapping must be deterministic to avoid message loss or bad retries.
-
-**Brief plan**
-- Add failure injection around `Store::Http` calls: connect/read timeouts, resets, non-JSON bodies, auth failures, `429/5xx`, and malformed payloads.
-- Define and test retry/backoff/jitter policy (or explicitly no-retry policy).
-- Assert mapping to SMTP reply classes (`4xx` transient vs `5xx` permanent).
-
-**Suggested deliverables**
-- `test/http_store_failures_test.rb`
-- Shared helper for fake upstream behavior matrix.
+**Deliverables**
+- Fix in `worker.rb` (one or two lines) + a test in `worker_pool_test.rb`.
 
 ---
 
-### 4) Crash/restart durability — **P0**
-**Why needed**
-- Restarts happen during deploys and incidents.
-- In-flight DATA handling must have clear guarantees (at-most-once/at-least-once) to avoid loss or duplication surprises.
+### N2) Dead worker Ractor silently drops 1/N of all future connections — **P0/P1** *(found while assessing #6)*
+**What the code does today**
+- `Server#dispatch` round-robins fd numbers over per-Ractor control pipes. If a
+  worker Ractor dies (bug, Ractor-mode Ruby regression), writes to its pipe raise
+  `EPIPE`, `dispatch` rescues, releases the slot, and closes the socket. There is
+  no respawn and no alarm: every Nth connection is silently dropped, forever.
 
-**Brief plan**
-- Add kill/restart tests at critical phases: after `DATA`, before store commit, after store commit, before SMTP ACK.
-- Document expected delivery semantics and validate with assertions.
+**Plan**
+- Pick a policy and test it. Two reasonable options:
+  1. **Fail fast**: a dead worker kills the server thread → `Daemon.run!` exits
+     non-zero → Docker/Kamal restarts the container. Simplest, matches the
+     existing "listener died" philosophy.
+  2. **Respawn**: detect the broken pipe, log loudly, spawn a replacement worker.
+- Either way, log at error level with enough context to notice in production.
 
-**Suggested deliverables**
-- `test/durability_restart_test.rb`
-- A short “delivery guarantees” section in `README.md`.
-
----
-
-### 5) Backpressure under sustained load — **P0**
-**Why needed**
-- Connection caps are useful, but production failure usually appears as resource exhaustion over time.
-- Slow clients can starve worker capacity.
-
-**Brief plan**
-- Add soak tests with mixed fast/slow clients and long-lived sessions.
-- Track memory/file descriptor growth and scheduler fairness over time.
-- Validate connection limiter release behavior under stress.
-
-**Suggested deliverables**
-- `test/soak/backpressure_test.rb`
-- CI nightly load profile (non-blocking for PRs initially).
+**Deliverables**
+- Policy implementation in `server.rb` + a test that kills a worker Ractor and
+  asserts the chosen behavior.
 
 ---
 
-### 6) Ractor-specific race/regression matrix — **P1**
-**Why needed**
-- Ractor mode adds concurrency complexity and Ruby-version sensitivity.
-- Races in fd handoff/release paths can cause stuck slots or dropped sessions.
+### N3) TLS misconfiguration silently degrades to plaintext-only — **P0 — DONE 2026-07-22** *(overlaps #10)*
 
-**Brief plan**
-- Add deterministic race tests for fd handoff, release pipe ordering, and worker crash recovery.
-- Run matrix across supported Ruby versions and worker modes (`auto`, `thread`).
+> **Resolved:** `TLS.material` now raises `TLS::Error` when
+> `MAIL_ON_RAILS_TLS_CERT`/`_KEY` are set but missing, unloadable, or set
+> without the other (`TLS.explicit_material`); the rescue-to-nil forgiveness
+> now scopes only the self-signed dev path. `Daemon.run!` catches `TLS::Error`
+> and exits 1 with a clear message (embedded `Daemon.start` callers get the
+> raise). Validated by `test/tls_material_test.rb` (8 tests: fatal paths,
+> valid path material, mismatched cert/key, half-set config, still-forgiving
+> dev path, and a `Daemon.run!` refuses-to-start test asserting non-zero exit
+> and the logged path — the fatal-path tests confirmed to fail against the
+> unfixed code, where the daemon boots plaintext and serves indefinitely).
+**What the code does today**
+- `Daemon.start` → `TLS.material` rescues *any* error (typo'd cert path,
+  unreadable key, malformed PEM), logs a warning, and boots anyway with
+  `material = nil`: the SMTPS listener is skipped, STARTTLS is never offered, and
+  AUTH is never offered (correctly, since it requires TLS). A one-character typo
+  in `MAIL_ON_RAILS_TLS_CERT` turns a production mail host into a
+  plaintext-only, no-submission server that *looks* up.
 
-**Suggested deliverables**
-- `test/worker_ractor_race_test.rb`
-- CI matrix job for concurrency modes.
+**Plan**
+- When `MAIL_ON_RAILS_TLS_CERT`/`_KEY` are explicitly set, treat failure to load
+  them as **fatal at boot**. Keep the graceful fallback only for the implicit
+  self-signed dev path.
 
----
-
-### 7) Protocol abuse / malformed SMTP command fuzzing — **P1**
-**Why needed**
-- SMTP edge services are internet-exposed and receive hostile input.
-- Parser robustness bugs can become DoS or bypass vulnerabilities.
-
-**Brief plan**
-- Add fuzz/property tests for commands, line endings, oversized input, control bytes, pipelining abuse, and dot-stuffing edge cases.
-- Ensure parser failures return safe SMTP errors without crashes.
-
-**Suggested deliverables**
-- `test/fuzz/smtp_parser_fuzz_test.rb`
-- Corpus seed files for malformed command cases.
-
----
-
-### 8) Security hardening edge cases — **P1**
-**Why needed**
-- Trust boundaries rely on correct header sanitation and auth protections.
-- Attackers will probe header smuggling and auth endpoint pressure.
-
-**Brief plan**
-- Expand tests for folded/duplicated trust headers, unusual casing, MIME/header injection tricks.
-- Add rate-limit/lockout behavior tests for auth attempts and per-IP abuse.
-
-**Suggested deliverables**
-- `test/security/header_sanitization_test.rb`
-- `test/security/auth_rate_limit_test.rb`
+**Deliverables**
+- Change in `daemon.rb`/`tls.rb` + config-validation tests (see #10).
 
 ---
 
-### 9) Observability failure modes — **P1**
-**Why needed**
-- Production incidents are solved through logs/metrics, not repros.
-- Without assertions, observability can silently degrade.
+### N4) Mixed-recipient partial failure double-queues outbound mail — **P1** *(overlaps #3, #16)*
+**What the code does today**
+- `Store::Http#smtp_store` with both remote and local recipients: it queues
+  outbound first, then POSTs inbound to the ingress. If outbound succeeds and the
+  ingress then fails, the session answers 451, the sending client retries the
+  whole message, and the outbound copies are queued **again**. (Crash between
+  ingress success and the SMTP 250 has the same shape — unavoidable SMTP
+  at-least-once — but this path duplicates on every retry while the ingress is
+  down.)
 
-**Brief plan**
-- Define required counters/events for timeout/tempfail/reject/dmarc outcomes.
-- Add tests that assert structured log fields and metric emission on failure paths.
+**Plan**
+- Decide: accept duplication (document it), or make `queue_outbound` idempotent
+  app-side (e.g. dedupe on a content hash), or split the reply per RFC (not
+  really possible — SMTP has one reply per message). Documenting + app-side
+  dedupe key is the pragmatic fix.
+- Add a test pinning whichever behavior is chosen.
 
-**Suggested deliverables**
-- `test/observability_failure_test.rb`
-- Observability field dictionary in docs.
-
----
-
-### 10) Config validation failures — **P1**
-**Why needed**
-- Misconfiguration is a top cause of deployment outages.
-- Startup should fail fast with clear diagnostics.
-
-**Brief plan**
-- Add startup validation tests for invalid ports, missing secrets, unreadable TLS files, incompatible worker settings.
-- Standardize error messages and non-zero exit behavior.
-
-**Suggested deliverables**
-- `test/config_validation_test.rb`
-- `bin/server --check-config` preflight mode.
+**Deliverables**
+- Test in `http_store_test.rb` + a "delivery guarantees" note (see #4).
 
 ---
 
-## B) Missing SMTP/platform features
+## A) Test coverage gaps — re-triaged
 
-### 11) Outbound delivery queue/relay engine clarity — **P1**
-**Why needed**
-- Current architecture appears inbound-first with outbound delegated.
-- Teams need explicit boundary clarity to avoid incorrect deployment assumptions.
+### 1) Real network/DNS failure behavior — **mostly DONE; residual P2**
+**Analysis**
+- The original premise ("unit tests with FakeResolver cannot prove behavior under
+  resolver timeouts, truncation, SERVFAIL") is out of date:
+  `test/dns_transport_test.rb` already runs a **scripted loopback nameserver**
+  (real UDP + TCP sockets) covering timeouts, UDP→TCP truncation retry,
+  NXDOMAIN-vs-SERVFAIL distinction, and unreachable servers.
+- The "assert 4xx vs 5xx SMTP outcomes" framing is also wrong for this design:
+  DNS failure does **not** tempfail the message — it yields `temperror` verdicts
+  that are stamped and delivered (README documents this deliberately).
 
-**Brief plan**
-- Document whether outbound MTA behavior is in-scope or delegated to host app/another service.
-- If in-scope later: define queue model, retries, MX resolution, bounce handling.
-
-**Suggested deliverables**
-- README architecture section update.
-- Optional roadmap issue for outbound module.
-
----
-
-### 12) Anti-abuse controls (rate limiting / tarpitting / greylisting / reputation hooks) — **P0**
-**Why needed**
-- Internet-facing SMTP must resist spam bursts and credential abuse.
-- Connection caps alone are insufficient.
-
-**Brief plan**
-- Add configurable per-IP and per-account rate limits.
-- Add optional tarpitting/greylisting hooks.
-- Add policy hook interface for allow/deny/reputation checks.
-
-**Suggested deliverables**
-- `lib/.../policy/abuse_control.rb` + tests
-- Env/config options with safe defaults.
+**Residual work (small)**
+- Malformed/garbage DNS packets: what does `Resolv::DNS::Message.decode` raising
+  do? (It should surface as no-verdict via `verify_sender`'s rescue, never kill a
+  session — pin that with a test.)
+- One end-to-end test: resolver raising `Dns::TempError` during a session →
+  message still accepted with `temperror` in the stamped
+  `X-MailOnRails-Auth-Results`.
 
 ---
 
-### 13) Spam/virus scanning integration points — **P1**
-**Why needed**
-- Most production mail stacks require malware/spam inspection before delivery.
-- Even if externalized, integration points should be first-class.
+### 2) TLS failure cases — **reframed, P1**
+**Analysis**
+- The original plan (expired certs, bad SAN/CN, invalid chain) tests behavior
+  this server doesn't have: it runs `VERIFY_NONE` and never validates client
+  certs; cert validity is the *client's* concern. Those tests would assert
+  OpenSSL, not this codebase.
+- The server-relevant failure modes are different, and one of them is N1 above.
 
-**Brief plan**
-- Define pre-ingress scanning hook contract.
-- Provide adapters or webhook pattern for rspamd/spamassassin/clamav style verdict ingestion.
-- Ensure verdicts propagate into trusted headers/metadata.
+**Revised plan**
+- Handshake stall / mid-handshake disconnect: session slot released, worker
+  survives (N1 covers the implicit-TLS half; add the STARTTLS half).
+- Garbage bytes after `STARTTLS` 220 → clean teardown (the `SSLError → IOError`
+  path in `SmtpServer#starttls`).
+- `TLS::ContextProvider` live-reload: touch cert/key files, assert a new context
+  is served; corrupt the files mid-"renewal", assert the old context keeps
+  serving (the rescue path in `ContextProvider#context`). This is load-bearing
+  for the Let's Encrypt renewal flow described in `config/deploy.yml` and is
+  currently untested.
 
-**Suggested deliverables**
-- `Scan::Adapter` interface + fake adapter tests.
-- Docs with example integration topology.
-
----
-
-### 14) Outbound DKIM signing (if submission scope expands) — **P2**
-**Why needed**
-- If this service ever sends outbound directly, DKIM signing is required for deliverability.
-
-**Brief plan**
-- Keep out-of-scope unless outbound transport is added.
-- If added: support key rotation and selector strategy.
-
-**Suggested deliverables**
-- Deferred roadmap item with prerequisites.
+**Deliverables**
+- `test/tls_failure_test.rb` (loopback; the existing `generate_self_signed`
+  helper makes fixtures — no fixture generator script needed).
 
 ---
 
-### 15) Extended RFC/ESMTP capability matrix (incl. SMTPUTF8 posture) — **P2**
-**Why needed**
-- Clients vary widely; unsupported extensions should be explicit.
-- Internationalization expectations should be documented.
+### 3) HTTP store failure taxonomy — **narrowed, P1**
+**Analysis**
+- Partially done: `http_store_test.rb` covers connection-refused → `:internal` →
+  451, ingress refusal → 451, and 507 → `:insufficient_storage` → 452.
+- "Define retry/backoff policy" is answered by the architecture: **deliberately
+  no retry** — the sending MTA is the retry queue (README, `Store::Http` docs).
+  Don't build backoff; document the no-retry policy explicitly and test the
+  mapping instead.
 
-**Brief plan**
-- Publish supported-command/extension matrix.
-- Add conformance tests for declared support and explicit reject behavior for unsupported features.
+**Residual work**
+- Read-timeout behavior (`Net::ReadTimeout` after 60 s) → `:internal` → 451, and
+  confirm a hung app can't wedge a session longer than the timeout.
+- Non-JSON 200 body → `JSON::ParserError` → 451 (pin it).
+- 401 from the internal API (wrong password) → currently indistinguishable from
+  any 5xx. Consider logging it distinctly — it's a config error, not weather.
+- N4 (outbound duplication) is the real taxonomy gap.
 
-**Suggested deliverables**
-- `docs/smtp_capability_matrix.md`
-- Capability regression tests.
-
----
-
-### 16) Queue durability semantics + dead-letter strategy — **P0**
-**Why needed**
-- Operators need clear recovery paths for poison messages and repeated downstream failures.
-
-**Brief plan**
-- Define retry windows, max attempts, and dead-letter behavior where applicable.
-- Emit operator-visible identifiers for replay/investigation.
-
-**Suggested deliverables**
-- Durability/queue policy doc.
-- Failure replay tooling (basic CLI/admin endpoint).
+**Deliverables**
+- Additional cases in `test/http_store_test.rb`; a short "no-retry policy"
+  paragraph in the `Store::Http` comment or README.
 
 ---
 
-### 17) Operational tooling (health/readiness, admin inspection, replay controls) — **P1**
-**Why needed**
-- Production operations need safe introspection and remediation tools.
+### 4) Crash/restart durability — **downgraded to P2 doc work**
+**Analysis**
+- The original plan assumed a local queue with commit points. There is none: the
+  only durable step is the ingress/API POST, and the code never ACKs before it
+  succeeds. The semantics are already deterministic and readable from
+  ~15 lines of `Store::Http#smtp_store`: **at-least-once**, with duplicates
+  possible if the process dies between ingress success and the SMTP 250 (plus
+  the N4 case). Kill-at-phase integration harnesses would be a lot of machinery
+  to re-prove what the code structure guarantees.
 
-**Brief plan**
-- Add health/readiness endpoints with dependency checks.
-- Add admin-safe interfaces for queue stats and controlled retries/purges.
-
-**Suggested deliverables**
-- `bin/healthcheck` or lightweight HTTP admin surface.
-- Operator runbook documentation.
-
----
-
-### 18) HA and horizontal-scale strategy — **P1**
-**Why needed**
-- Multi-instance deployments need deterministic behavior under failover.
-
-**Brief plan**
-- Define stateless/stateful boundaries and required shared components.
-- Document load-balancer expectations, sticky-session requirements (if any), and failure modes.
-
-**Suggested deliverables**
-- `docs/ha_deployment.md`
-- Staging chaos test plan.
+**Revised plan**
+- Write the "delivery guarantees" README section (this part of the original item
+  was right): no local spool; tempfail-and-retry when the app is down;
+  at-least-once; duplicate windows named explicitly.
+- Keep `test_disconnect_mid_data_stores_nothing` (already exists) as the pinned
+  at-most-once-before-commit behavior.
 
 ---
 
-### 19) Tenant/domain policy controls — **P2**
-**Why needed**
-- Multi-tenant production systems need per-domain/per-tenant overrides (limits, auth, enforcement).
-
-**Brief plan**
-- Add policy lookup hooks in session/auth flow.
-- Support domain-scoped toggles for enforcement and routing.
-
-**Suggested deliverables**
-- Policy interface + integration tests.
-- Config schema for tenant overrides.
+### 5) Backpressure under sustained load — **folded into #12; soak optional P2**
+**Analysis**
+- The concrete exposure is not gradual resource creep — sessions are fibers with
+  capped buffers — it's that the **global 100-connection cap has no per-IP
+  component**: one IP can hold all 100 slots for 300 s each (or forever, via N1).
+  That is an anti-abuse feature gap (#12), not a soak-test gap.
+- A nightly soak profile is respectable but low-yield for a single-tenant
+  personal stack; keep it as an optional P2 once per-IP caps exist.
 
 ---
 
-### 20) Compliance/audit controls — **P2**
-**Why needed**
-- Enterprises often require retention controls, auditability, and PII-safe logging.
-
-**Brief plan**
-- Define audit event schema and retention lifecycle.
-- Add configurable redaction/minimization for sensitive fields in logs.
-
-**Suggested deliverables**
-- `docs/compliance_and_audit.md`
-- Audit/redaction test coverage.
+### 6) Ractor race/regression matrix — **kept, focused: see N2, P1**
+**Analysis**
+- Ractor mode is genuinely the most fragile surface (the code itself documents
+  Ruby 4.0.6 workarounds in `scheduler.rb`/`worker.rb`), and existing Ractor
+  tests cover only happy paths + the release pipe.
+- The highest-value single case is worker death (N2). Deterministic "race tests"
+  for fd handoff ordering are hard to make non-flaky and the pipe protocol is
+  simple; prefer the death/recovery test plus keeping the existing loopback
+  tests running in both modes.
+- A CI matrix across Ruby versions is worthwhile the day this has CI at all —
+  note there is currently **no CI config in the repo**, which is arguably a
+  prerequisite TODO for half this document.
 
 ---
 
-## Suggested execution phases
+### 7) Protocol fuzzing — **kept, scaled down, P1**
+**Analysis**
+- Real, but right-size it: the dispatcher is small and the scary cases
+  (dot-stuffing smuggling, CRLF split at the chunk cap, overlong lines, flood
+  past 2× size cap) are already pinned in `smtp_session_test.rb`.
 
-### Phase 1 (P0 baseline)
-- Items: 1, 2, 3, 4, 5, 12, 16
-- Goal: safe early production rollout with clear failure behavior.
+**Revised plan**
+- One deterministic test file (seeded PRNG, not a fuzzing framework): random
+  garbage lines, control bytes/NUL, invalid UTF-8, absurd pipelining, base64
+  garbage to AUTH continuations, `MAIL FROM` args with CR/LF-adjacent junk.
+  Assert: some 4xx/5xx reply or clean disconnect, session never raises through
+  `Session#run`, store never receives a partial message.
 
-### Phase 2 (P1 hardening)
-- Items: 6, 7, 8, 9, 10, 11, 13, 17, 18
-- Goal: stronger resilience, diagnostics, and operational maturity.
+**Deliverables**
+- `test/smtp_parser_abuse_test.rb` (no corpus files needed at this size).
 
-### Phase 3 (P2 scale/future)
-- Items: 14, 15, 19, 20
-- Goal: long-term capability expansion and enterprise readiness.
+---
+
+### 8) Security hardening edge cases — **split: header tests cheap P1; rate limits → #12**
+**Analysis**
+- Header smuggling defenses exist and are partially tested
+  (`IngressClient#strip_trusted_headers` handles folded headers via the
+  `\r?\n(?![ \t])` split; forged-copy stripping is tested).
+- Auth abuse: `MAX_AUTH_ATTEMPTS = 3` is **per-session** only. Reconnecting
+  grants a fresh 3 guesses, and every guess is an HTTP call to the host app —
+  unthrottled credential stuffing passes straight through. That's the #12 work.
+
+**Residual work (cheap)**
+- Tests: forged *folded* trust header (with continuation line) fully stripped;
+  mixed-case `x-mailonrails-*`; bare-LF line endings in the submitted header
+  block; CR/LF injection attempts through `MAIL FROM`/`RCPT TO` values reaching
+  `sanitize_header`.
+
+**Deliverables**
+- Cases added to `test/http_store_test.rb` / a small
+  `test/ingress_stamping_test.rb`.
+
+---
+
+### 9) Observability failure modes — **downgraded to P2**
+**Analysis**
+- The original plan presupposes a metrics system; none exists, and building a
+  field dictionary + metric assertions before there is a consumer is inverted.
+  Logging is already consistent (every reject/tempfail path logs with peer IP,
+  credentials are redacted, DATA is never traced — and *that* is tested).
+
+**Revised plan**
+- Defer until something consumes metrics. If/when: a `store.count(event)`-style
+  hook is the natural seam, since every interesting path already calls the store.
+
+---
+
+### 10) Config validation — **kept, P1 (with N3 as the P0 core)**
+**Analysis**
+- Correct and cheap. Today: bad port strings raise a bare `ArgumentError` from
+  `Integer()`; a missing internal-API password only surfaces as runtime 451s/535s;
+  explicit TLS paths that don't load fall back to plaintext (N3).
+
+**Plan**
+- Boot-time validation with clear messages: ports parse, TLS material loads when
+  explicitly configured (N3 = fatal), warn loudly when
+  `MAIL_ON_RAILS_INTERNAL_API_PASSWORD`/ingress password are unset outside dev.
+- `bin/server --check-config`: run the same validation and exit 0/1 — useful as a
+  deploy preflight and a Docker HEALTHCHECK-adjacent smoke test.
+
+**Deliverables**
+- `test/config_validation_test.rb`; validation in `daemon.rb`; `--check-config`.
+
+---
+
+## B) Features — re-triaged
+
+### 12) Anti-abuse: per-IP caps + auth throttling — **P0, narrowed** *(absorbs #5, #8-auth)*
+**Analysis**
+- The one genuinely missing production feature. Today a single IP can: hold all
+  100 connection slots (300 s idle each, or forever via N1), and stuff
+  credentials at full speed limited only by 3-per-connection.
+- Tarpitting, greylisting, and reputation-hook interfaces from the original item
+  are over-scope for this stack — spam policy has a natural home in the host
+  app's mailroom. Cut them.
+
+**Plan**
+- **Per-IP concurrent connection cap** (e.g. default 10) in/beside `ConnLimiter`.
+  Must live on the accept side — worker Ractors are isolated, so session-side
+  state can't be shared. `ConnLimiter` already runs accept-side, so this is a
+  natural extension of it (acquire/release keyed by IP).
+- **Per-IP auth-failure lockout with decay** (e.g. 10 failures → refuse AUTH from
+  that IP for 15 min). Same accept-side placement problem: simplest is a small
+  mutex-guarded table owned by the accept side, consulted at accept or passed as
+  a shared pipe-message; alternatively enforce app-side in the `authenticate`
+  endpoint. Choose during implementation — the Ractor boundary is the design
+  constraint to solve.
+- Config via env with safe defaults; both limits off = current behavior.
+
+**Deliverables**
+- Extension of `conn_limiter.rb` (+ session/auth hook) with tests; env knobs
+  documented in README.
+
+---
+
+### 17) Operational tooling — **scaled down to a healthcheck, P2**
+**Analysis**
+- Queue stats/replay/purge belong to the host app (it owns the queue). What this
+  daemon lacks is any liveness signal for Docker/Kamal beyond "process exists".
+
+**Plan**
+- `bin/healthcheck`: TCP-connect to the MX port, expect a `220` banner, exit 0/1.
+  Wire it as the Dockerfile `HEALTHCHECK`/Kamal check.
+
+---
+
+### 15) ESMTP capability matrix — **P2 doc, as originally proposed**
+- Small and legit: a table of supported commands/extensions (`SIZE`, `8BITMIME`,
+  `PIPELINING`, `STARTTLS`, `AUTH PLAIN LOGIN`; `SMTPUTF8` not advertised;
+  unknown commands → 502). A handful of conformance assertions already exist in
+  the session tests; extend slightly rather than building a new suite.
+
+---
+
+### 18) HA / horizontal scale — **P2 doc**
+**Analysis**
+- The daemon is stateless by design (all state is HTTP calls to the app), so the
+  original "define stateless/stateful boundaries" work is a paragraph, not a
+  project: N instances behind multiple MX records / an L4 LB just work; no sticky
+  sessions; the shared dependency and real SPOF is the host app. Note the
+  per-deploy downtime window from `.kamal/hooks/pre-app-boot` (stop-old-first) —
+  peers retry, but it belongs in the doc.
+
+---
+
+## Resolved / out of scope (with reasons)
+
+- **(11) Outbound relay boundary clarity** — already documented: README and
+  `config/deploy.yml` both state outbound queueing is delegated to the host app
+  via `POST outbound_messages`. No action.
+- **(13) Spam/virus scanning hooks** — the host app receives the complete
+  message with auth verdicts stamped; it is the natural scanning/policy point.
+  A daemon-side hook would duplicate that seam. Revisit only if pre-DATA
+  rejection (saving bandwidth on huge spam) ever matters at this scale.
+- **(14) Outbound DKIM signing** — not "deferred": **out of scope permanently
+  for this repo**. Outbound transport lives in the host app; signing belongs
+  where sending happens.
+- **(16) Queue durability / dead-letter** — no queue exists in this daemon;
+  inbound durability is the sending MTA's retry queue, outbound durability is
+  the host app's queue. The one real artifact (duplication window) is N4.
+- **(19) Tenant/domain policy controls** — YAGNI for a single-app personal
+  stack; per-account policy already lives behind the internal API
+  (`authenticate`, `rcpt_check`), which is the right extension point if ever
+  needed.
+- **(20) Compliance/audit** — YAGNI now; the pieces that matter are done
+  (credential redaction and DATA exclusion in traces, both tested).
+
+---
+
+## Revised execution order
+
+### Phase 1 — before real traffic (P0)
+1. **N1** implicit-TLS handshake timeout (small fix, closes an unauthenticated DoS)
+2. **N3** fail-fast on explicit TLS config errors (small fix)
+3. **12** per-IP connection cap + auth-failure throttle
+4. **N2** worker-Ractor death policy (fail-fast is acceptable and cheapest)
+
+### Phase 2 — hardening (P1)
+5. **10** config validation + `--check-config`
+6. **3 + N4** HTTP store: timeout/non-JSON cases, duplication test, no-retry doc
+7. **2** TLS failure tests incl. ContextProvider renewal reload
+8. **7** parser abuse test file
+9. **8** trust-header edge-case tests
+10. CI setup (prerequisite for the "matrix" ambitions in #6)
+
+### Phase 3 — docs and polish (P2)
+11. **4** delivery-guarantees README section
+12. **17** `bin/healthcheck`
+13. **15** capability matrix doc
+14. **18** HA paragraph
+15. **1** DNS malformed-packet + end-to-end temperror tests
+16. **5** optional soak profile; **9** metrics hook when a consumer exists

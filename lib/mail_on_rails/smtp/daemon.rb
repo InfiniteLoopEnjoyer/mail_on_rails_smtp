@@ -29,6 +29,11 @@ module MailOnRails
         # non-zero so Docker restarts the container.
         logger.error "[mail_on_rails] SMTP server exited - shutting down"
         exit 1
+      rescue TLS::Error => e
+        # Explicitly configured TLS that fails to load must not boot a
+        # plaintext-only mail host that looks healthy.
+        logger.error "[mail_on_rails] #{e.message} - refusing to start"
+        exit 1
       end
 
       # Starts the server on a named thread and returns it. A server that

@@ -91,7 +91,7 @@ module MailOnRails
       # can cross into worker Ractors.
       def build_session_specs
         @listeners.map do |spec|
-          Ractor.make_shareable(spec.slice(:host, :port, :tls, :role, :hostname, :trace))
+          Ractor.make_shareable(spec.slice(:host, :port, :tls, :role, :hostname, :trace, :handshake_timeout))
         end
       end
 
