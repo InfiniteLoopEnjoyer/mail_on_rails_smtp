@@ -29,10 +29,21 @@ module MailOnRails
       #     replies, and unreachable/timing-out nameservers raise
       #     TempError, so a DNS outage reads as temperror rather than
       #     silently weakening a verdict to "no record".
+      #
+      # Answers (including "no record") are cached per name and type for a
+      # short TTL - big senders deliver many messages in a burst, each
+      # re-fetching the same SPF/DKIM/DMARC records. The cache honors
+      # record TTLs below the cap and never caches failures (a resolver
+      # blip must not pin temperror verdicts). Use .shared to get the
+      # calling worker thread's client so session fibers share the cache.
       class Dns
         class TempError < StandardError; end
 
         TIMEOUT = Config.int("MAIL_ON_RAILS_DNS_TIMEOUT", 5, min: 1)
+        # Cap in seconds on how long an answer is cached (the records' own
+        # TTLs bind below it); 0 disables caching.
+        CACHE_TTL = Config.int("MAIL_ON_RAILS_DNS_CACHE_TTL", 60)
+        SWEEP_THRESHOLD = 10_000 # purge expired answers when the cache grows past this
         PORT = 53
         MAX_UDP = 4096
 
@@ -47,11 +58,25 @@ module MailOnRails
           [ "127.0.0.1" ]
         end.freeze
 
-        # port is injectable so tests can stand up a loopback DNS server.
-        def initialize(nameservers: SYSTEM_NAMESERVERS, timeout: TIMEOUT, port: PORT)
+        # The calling thread's client, so every session fiber on a worker
+        # shares one answer cache. Thread-level (not fiber-level: Thread#[]
+        # is fiber-local); worker Ractors are isolated, so per-worker is as
+        # shared as a cache can be.
+        def self.shared
+          Thread.current.thread_variable_get(:mail_on_rails_dns) ||
+            Thread.current.thread_variable_set(:mail_on_rails_dns, new)
+        end
+
+        # port, cache_ttl and clock are injectable so tests can stand up a
+        # loopback DNS server and steer expiry; clock must be monotonic.
+        def initialize(nameservers: SYSTEM_NAMESERVERS, timeout: TIMEOUT, port: PORT,
+                       cache_ttl: CACHE_TTL, clock: -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) })
           @nameservers = nameservers
           @timeout = timeout
           @port = port
+          @cache_ttl = cache_ttl
+          @clock = clock
+          @cache = {} # "<typeclass> <name>" => [records, expires_at]
         end
 
         # TXT: each record's character-strings joined, one string per record.
@@ -83,15 +108,46 @@ module MailOnRails
         private
 
         def resources(name, typeclass)
+          key = "#{typeclass.name} #{name.to_s.downcase}"
+          if (records = cache_fetch(key))
+            return records
+          end
+
           reply = exchange(name.to_s, typeclass)
           case reply.rcode
           when Resolv::DNS::RCode::NoError
-            reply.answer.filter_map { |_owner, _ttl, record| record if record.is_a?(typeclass) }
+            records = reply.answer.filter_map { |_owner, _ttl, record| record if record.is_a?(typeclass) }
+            cache_store(key, records, reply.answer.map { |_owner, ttl, _record| ttl })
           when Resolv::DNS::RCode::NXDomain
-            []
+            cache_store(key, [], [])
           else
             raise TempError, "DNS rcode #{reply.rcode} for #{name}"
           end
+        end
+
+        # A cached answer (possibly empty), or nil on miss/expiry. Fibers on
+        # this thread interleave only at IO, so plain Hash access is safe.
+        def cache_fetch(key)
+          return nil unless @cache_ttl.positive?
+
+          records, expires_at = @cache[key]
+          records if expires_at && expires_at > @clock.call
+        end
+
+        # Caches for the smaller of the cap and the answer's own record
+        # TTLs (a 0-TTL record therefore never effectively caches). Only
+        # answers land here - TempError propagates before this point.
+        def cache_store(key, records, ttls)
+          return records unless @cache_ttl.positive?
+
+          now = @clock.call
+          sweep(now) if @cache.size >= SWEEP_THRESHOLD
+          @cache[key] = [ records, now + [ @cache_ttl, *ttls ].min ]
+          records
+        end
+
+        def sweep(now)
+          @cache.delete_if { |_key, (_records, expires_at)| expires_at <= now }
         end
 
         # Asks each nameserver in turn; first decodable reply wins. Raises

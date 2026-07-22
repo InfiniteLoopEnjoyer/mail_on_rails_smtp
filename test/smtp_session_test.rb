@@ -12,6 +12,12 @@ class SmtpSessionTest < Minitest::Test
   PASSWORD = "pw-123456"
   RAW = "From: sender@remote.test\r\nSubject: hi\r\n\r\nbody line\r\n"
 
+  # Test double for the spec[:dnsbl] seam: a fixed verdict, no DNS.
+  class FakeDnsbl
+    def initialize(zone) = @zone = zone
+    def listed(_ip) = @zone
+  end
+
   def setup
     @store = MailOnRails::Smtp::Store::Memory.new
     @store.add_account(email: EMAIL, password: PASSWORD)
@@ -54,6 +60,26 @@ class SmtpSessionTest < Minitest::Test
     yield
   ensure
     singleton.define_method(:verify, original)
+  end
+
+  def test_mx_session_refuses_mail_from_a_dnsbl_listed_ip
+    with_session(spec_extra: { dnsbl: FakeDnsbl.new("bl.test") }) do |client|
+      read_reply(client)
+      assert_match(/\A250/, command(client, "EHLO client.test"))
+      reply = command(client, "MAIL FROM:<sender@remote.test>")
+      assert_match(/\A554 5\.7\.1 /, reply)
+      assert_match(/bl\.test/, reply, "the reply should name the listing zone")
+      assert_match(/\A503/, command(client, "RCPT TO:<#{EMAIL}>"), "the envelope must not have started")
+      assert_match(/\A221/, command(client, "QUIT"))
+    end
+  end
+
+  def test_mx_session_accepts_mail_from_an_unlisted_ip
+    with_session(spec_extra: { dnsbl: FakeDnsbl.new(nil) }) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A250/, command(client, "MAIL FROM:<sender@remote.test>"))
+    end
   end
 
   def test_mx_session_accepts_local_mail_end_to_end

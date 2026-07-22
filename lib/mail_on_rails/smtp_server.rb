@@ -4,6 +4,7 @@ require "mail_on_rails/smtp/config"
 require "mail_on_rails/smtp/server"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/smtp/sender_auth"
+require "mail_on_rails/smtp/dnsbl"
 require "mail_on_rails/smtp/clamav_client"
 
 module MailOnRails
@@ -39,6 +40,11 @@ module MailOnRails
     MAX_CONNECTIONS_PER_IP = Smtp::Config.int("MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP", 10)
     AUTH_LOCKOUT_FAILURES = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES", 10)
     AUTH_LOCKOUT_SECONDS = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS", 900, min: 1)
+    # Sliding-window connection rate per peer IP; connections over the
+    # budget are tarpitted with an escalating pre-banner delay (see
+    # Smtp::RateLimiter). 0 disables.
+    CONN_RATE_LIMIT = Smtp::Config.int("MAIL_ON_RAILS_SMTP_CONN_RATE", 60)
+    CONN_RATE_WINDOW = Smtp::Config.int("MAIL_ON_RAILS_SMTP_CONN_RATE_WINDOW", 60, min: 1)
     # Protocol tracing default; per-listener spec[:trace] overrides. Read at
     # load time because worker Ractors cannot access ENV.
     TRACE_DEFAULT = ENV["MAIL_ON_RAILS_SMTP_TRACE"] == "1"
@@ -285,6 +291,11 @@ module MailOnRails
         end
 
         from = Regexp.last_match(1)
+        if (zone = rbl_listing)
+          @store.log(:info, "SMTP rejected MAIL FROM:<#{from}> from #{peer_ip}: listed by DNSBL #{zone}")
+          return reply 554, "5.7.1 Service unavailable; #{peer_ip} is listed by #{zone}"
+        end
+
         if @authenticated_as && !from.strip.casecmp?(@authenticated_as)
           return reply 550, "Sender address must match authenticated account"
         end
@@ -466,6 +477,24 @@ module MailOnRails
         Smtp::SenderAuth.verify(ip: peer_ip, helo: @helo_name, mail_from: @mail_from, data: body)
       rescue StandardError => e
         @store.log(:error, "SMTP sender verification error: #{e.class}: #{e.message}")
+        nil
+      end
+
+      # DNSBL verdict for this peer: the configured zone that lists it, or
+      # nil. Checked only for unauthenticated MX traffic - authenticated
+      # clients vouch for themselves - and at MAIL FROM rather than at
+      # connect, so a legitimate sender stuck on a listed IP can still
+      # STARTTLS + AUTH its way in. spec[:dnsbl] is the test seam (worker
+      # Ractors cannot read ENV at runtime; the default checker's zones are
+      # parsed at load, its verdict cache shared per worker thread). Never
+      # lets a checker bug refuse mail - failure just means no verdict.
+      def rbl_listing
+        return nil unless @spec[:role] == :mx && !@authenticated_as
+
+        checker = @spec.fetch(:dnsbl) { Smtp::Dnsbl.shared }
+        checker&.listed(peer_ip)
+      rescue StandardError => e
+        @store.log(:error, "SMTP DNSBL check error: #{e.class}: #{e.message}")
         nil
       end
 

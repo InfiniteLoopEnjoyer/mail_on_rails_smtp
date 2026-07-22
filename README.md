@@ -190,8 +190,13 @@ surfaces:
 | `MAIL_ON_RAILS_TLS_HOSTS` | `localhost` | Comma-separated SANs for the self-signed cert (hostname is always added) |
 | `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
 | `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
+| `MAIL_ON_RAILS_DNS_CACHE_TTL` | `60` | Cap in seconds on the per-worker DNS answer cache (record TTLs bind below it; `0` disables) |
+| `MAIL_ON_RAILS_RBLS` | - | Comma-separated DNSBL zones (e.g. `zen.spamhaus.org`); unauthenticated MX mail from a listed IP is refused at `MAIL FROM` with `554 5.7.1`. Fails open on DNS trouble |
+| `MAIL_ON_RAILS_RBL_CACHE_TTL` | `600` | Seconds a DNSBL verdict is cached per peer IP |
 | `MAIL_ON_RAILS_SMTP_MAX_CONN` | `100` | Connection cap |
 | `MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP` | `10` | Concurrent connections per peer IP (`0` disables) |
+| `MAIL_ON_RAILS_SMTP_CONN_RATE` | `60` | Connections per peer IP per window before the banner is tarpitted (escalating 1 s → 16 s; loopback exempt; `0` disables) |
+| `MAIL_ON_RAILS_SMTP_CONN_RATE_WINDOW` | `60` | Sliding-window seconds for the connection rate |
 | `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES` | `10` | Failed AUTHs per IP before lockout (`0` disables) |
 | `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS` | `900` | Lockout duration; also the failure-decay window |
 | `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
@@ -230,6 +235,13 @@ an empty result, while SERVFAIL/timeouts raise `Dns::TempError` and
 verifiers record `temperror` verdicts, so a DNS outage is visible in
 `Authentication-Results` instead of silently weakening every verdict to
 `none`.
+
+Answers (including "no record") are cached per worker for up to
+`MAIL_ON_RAILS_DNS_CACHE_TTL` seconds (default 60; record TTLs bind below
+the cap, failures are never cached), so a burst of messages from one
+sender costs one fetch of its SPF/DKIM/DMARC records, not one per message.
+The DNSBL checks reuse the same client and add their own per-IP verdict
+cache (`MAIL_ON_RAILS_RBL_CACHE_TTL`).
 
 ## Test / run
 

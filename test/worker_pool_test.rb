@@ -232,6 +232,32 @@ class WorkerPoolTest < Minitest::Test
     assert wait_for_free_slot(spec), "per-IP slot was not released after QUIT"
   end
 
+  # Connections over the per-IP rate budget are not refused - their banner
+  # is tarpitted. Loopback peers are exempt from the accept-side RateLimiter
+  # (see its unit tests), so the delay plumbing - dispatch tuple through
+  # Worker#handle's pre-banner fiber sleep - is exercised directly here.
+  def test_tarpit_delay_is_served_before_the_banner
+    queue = Thread::Queue.new
+    worker = MailOnRails::Smtp::Worker.new(store: memory_store,
+                                           session_class: MailOnRails::SmtpServer::Session)
+    thread = Thread.new { worker.serve_queue(queue) }
+    @cleanup << -> { queue.close; thread.join(5) }
+
+    listener = TCPServer.new("127.0.0.1", 0)
+    @cleanup << -> { listener.close rescue nil }
+    spec = { host: "127.0.0.1", port: listener.addr[1], tls: :starttls, role: :mx, hostname: "mx.test" }
+    client = connect(spec)
+    session_socket = listener.accept
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    queue.push([ session_socket, spec, "192.0.2.9", 0.5 ])
+
+    assert_match(/\A220 /, read_reply(client), "a tarpitted connection must still be served")
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :>=, 0.4, "the banner should wait out the tarpit delay"
+  end
+
   # Wrong-password AUTHs across ONE connection must lock the IP for the NEXT
   # connection - the throttle spans connections, unlike MAX_AUTH_ATTEMPTS.
   def test_auth_lockout_refuses_subsequent_connections

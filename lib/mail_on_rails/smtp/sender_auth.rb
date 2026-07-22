@@ -57,7 +57,7 @@ module MailOnRails
         ENV["MAIL_ON_RAILS_DMARC_ENFORCE"] == "1"
       end
 
-      def self.verify(ip:, helo:, mail_from:, data:, resolver: Dns.new)
+      def self.verify(ip:, helo:, mail_from:, data:, resolver: Dns.shared)
         spf = Spf.new(resolver).check(ip: ip, sender: mail_from, helo: helo)
         dkim = Dkim.new(resolver).verify(data)
         dmarc = Dmarc.new(resolver).evaluate(from_domain: from_domain(data), spf: spf, dkim: dkim)

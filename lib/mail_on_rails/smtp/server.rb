@@ -5,6 +5,7 @@ require "etc"
 require_relative "config"
 require_relative "conn_limiter"
 require_relative "auth_throttle"
+require_relative "rate_limiter"
 require_relative "tls"
 require_relative "worker"
 
@@ -36,9 +37,12 @@ module MailOnRails
     #     the store is an injected in-process instance (tests, embedded
     #     development) or when MAIL_ON_RAILS_SMTP_WORKER_MODE=thread.
     #
-    # The ConnLimiter and AuthThrottle always live on the accept side, so
-    # the connection caps (process-wide and per-IP) and the per-IP
-    # auth-failure lockout stay exact across both modes.
+    # The ConnLimiter, AuthThrottle and RateLimiter always live on the
+    # accept side, so the connection caps (process-wide and per-IP), the
+    # per-IP auth-failure lockout and the per-IP connection rate stay exact
+    # across both modes. Tarpit delays the rate limiter hands out are
+    # threaded through dispatch and served by the worker (a fiber sleep
+    # before the banner), never on an accept thread.
     #
     # Subclasses define MAX_CONNECTIONS and the protocol specifics:
     # protocol_name, busy_line (sent when the connection cap is hit),
@@ -58,6 +62,8 @@ module MailOnRails
       MAX_CONNECTIONS_PER_IP = nil
       AUTH_LOCKOUT_FAILURES = nil
       AUTH_LOCKOUT_SECONDS = 900
+      CONN_RATE_LIMIT = nil
+      CONN_RATE_WINDOW = 60
 
       # Worker deaths tolerated per process lifetime before the failure is
       # treated as systemic and the server shuts down (the daemon exits
@@ -77,6 +83,8 @@ module MailOnRails
         @limiter = ConnLimiter.new(self.class::MAX_CONNECTIONS, per_ip: self.class::MAX_CONNECTIONS_PER_IP)
         @throttle = AuthThrottle.new(limit: self.class::AUTH_LOCKOUT_FAILURES,
                                      window: self.class::AUTH_LOCKOUT_SECONDS)
+        @rate = RateLimiter.new(limit: self.class::CONN_RATE_LIMIT,
+                                window: self.class::CONN_RATE_WINDOW)
         @worker_count = [ workers || Config.int("MAIL_ON_RAILS_SMTP_WORKERS", Etc.nprocessors, min: 1), 1 ].max
         @dispatchers = []
         @round_robin = 0
@@ -271,10 +279,11 @@ module MailOnRails
           socket = server.accept
           tune_keepalive(socket)
           ip = peer_ip(socket)
+          delay = @rate.delay(ip) # every attempt counts, even ones refused below
           if @throttle.locked?(ip)
             reject(socket, locked_line) # before acquire: locked IPs must not consume slots
           elsif @limiter.acquire(ip)
-            dispatch(socket, session_spec, spec_index, ip)
+            dispatch(socket, session_spec, spec_index, ip, delay)
           else
             reject(socket, busy_line)
           end
@@ -289,18 +298,20 @@ module MailOnRails
       # (and reaches the replacement worker). Control-pipe lines are tiny
       # and workers drain them promptly, so holding the lock across the
       # write does not stall the accept threads.
-      def dispatch(socket, session_spec, spec_index, ip)
+      def dispatch(socket, session_spec, spec_index, ip, delay = 0.0)
         @mutex.synchronize do
           @round_robin += 1
           worker_index = @round_robin % @dispatchers.size
           target = @dispatchers[worker_index]
           if target.is_a?(Thread::Queue)
-            target.push([ socket, session_spec, ip ])
+            target.push([ socket, session_spec, ip, delay ])
           else
             # The worker Ractor owns the fd from here; keep our IO object
             # from closing it behind the worker's back when GC collects it.
+            # The tarpit delay travels before the ip: the ip may be blank,
+            # so it must stay the (optional) last field.
             socket.autoclose = false
-            target.write("#{socket.fileno} #{spec_index} #{ip}\n")
+            target.write("#{socket.fileno} #{spec_index} #{format("%g", delay)} #{ip}\n")
             @inflight[worker_index][ip.to_s] += 1
           end
         end

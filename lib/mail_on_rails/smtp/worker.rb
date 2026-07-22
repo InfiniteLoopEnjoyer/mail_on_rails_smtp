@@ -15,8 +15,9 @@ module MailOnRails
     #
     #   Ractor mode (Worker.spawn_ractor): one Worker per core, each inside
     #   its own Ractor for true parallelism. Sockets cross the boundary as
-    #   raw fd numbers over a control pipe ("<fd> <spec index> <peer ip>\n"
-    #   lines) and are re-wrapped with TCPSocket.for_fd - fds are
+    #   raw fd numbers over a control pipe ("<fd> <spec index> <tarpit
+    #   delay> <peer ip>\n" lines) and are re-wrapped with TCPSocket.for_fd
+    #   - fds are
     #   process-global, and integers avoid Ractor IO moves entirely (moved
     #   IOs misbehave under a fiber scheduler on Ruby 4.0.6; see
     #   scheduler.rb). The worker builds its own store and TLS context
@@ -62,8 +63,8 @@ module MailOnRails
         serve do
           line = control_r.gets
           if line
-            fd, index, ip = line.split
-            [ TCPSocket.for_fd(Integer(fd)), specs.fetch(Integer(index)), ip ]
+            fd, index, delay, ip = line.split
+            [ TCPSocket.for_fd(Integer(fd)), specs.fetch(Integer(index)), ip, Float(delay) ]
           end
         end
       end
@@ -112,16 +113,21 @@ module MailOnRails
         Fiber.set_scheduler(scheduler)
         Fiber.schedule do
           loop do
-            socket, spec, ip = supplier.call
+            socket, spec, ip, delay = supplier.call
             break unless socket
 
-            Fiber.schedule { handle(socket, spec, ip) }
+            Fiber.schedule { handle(socket, spec, ip, delay) }
           end
         end
         scheduler.close # serves until every session finishes; re-raises fatal errors
       end
 
-      def handle(socket, spec, ip = nil)
+      def handle(socket, spec, ip = nil, delay = nil)
+        # Tarpit (RateLimiter's verdict, threaded through dispatch): served
+        # before the TLS handshake and banner. sleep under the scheduler
+        # parks this session's fiber only, but the connection keeps holding
+        # its ConnLimiter slot - that is the cost to the flooding peer.
+        sleep(delay) if delay&.positive?
         ctx = @tls&.context
         if spec[:tls] == :implicit && ctx
           socket.timeout = spec[:handshake_timeout] || HANDSHAKE_TIMEOUT if socket.respond_to?(:timeout=)
