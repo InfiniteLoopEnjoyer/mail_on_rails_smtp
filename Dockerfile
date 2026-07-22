@@ -44,4 +44,9 @@ COPY --chown=smtp:smtp --from=build "${BUNDLE_PATH}" "${BUNDLE_PATH}"
 COPY --chown=smtp:smtp --from=build /smtp /smtp
 
 EXPOSE 1025 1587 1465
+
+# Liveness: the MX listener must answer its banner (421-busy still counts
+# as alive - see bin/healthcheck).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD ["bin/healthcheck"]
+
 CMD ["bin/server"]

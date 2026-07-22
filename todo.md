@@ -153,7 +153,16 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ## A) Test coverage gaps — re-triaged
 
-### 1) Real network/DNS failure behavior — **mostly DONE; residual P2**
+### 1) Real network/DNS failure behavior — **DONE 2026-07-22**
+
+> **Residual resolved:** `FakeDns` extracted to `test/fake_dns.rb` (shared
+> harness); transport tests added for malformed UDP replies, malformed TCP
+> replies after truncation, and spoofed-id replies — all raise `TempError`
+> as designed. New `test/sender_auth_temperror_test.rb` proves the
+> end-to-end story against a live SERVFAIL nameserver: `SenderAuth.verify`
+> degrades to `spf=temperror`/`dmarc=temperror`, and a full session still
+> accepts the message with those verdicts stamped on the stored copy — a
+> DNS outage never bounces mail or kills a session.
 **Analysis**
 - The original premise ("unit tests with FakeResolver cannot prove behavior under
   resolver timeouts, truncation, SERVFAIL") is out of date:
@@ -240,7 +249,12 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 4) Crash/restart durability — **downgraded to P2 doc work**
+### 4) Crash/restart durability — **DONE 2026-07-22 (doc)**
+
+> **Resolved:** README gained a "Delivery guarantees" section: no local
+> spool, ACK only after the HTTP handoff, tempfail-and-sender-retries when
+> the app is down, at-least-once semantics with both duplicate windows
+> named (and pinned by tests via #3/N4).
 **Analysis**
 - The original plan assumed a local queue with commit points. There is none: the
   only durable step is the ingress/API POST, and the code never ACKs before it
@@ -385,6 +399,29 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ## B) Features — re-triaged
 
+### 17) Operational tooling — **DONE 2026-07-22 (healthcheck)**
+
+> **Resolved:** `bin/healthcheck` probes the MX listener's banner (a 421
+> busy banner counts as alive — restarts don't fix fullness) and is wired
+> as the Dockerfile `HEALTHCHECK`. Tested as a real subprocess against a
+> live server, a dead port, and a non-SMTP service
+> (`test/healthcheck_test.rb`). Queue admin/replay stays app-side.
+
+### 15) ESMTP capability matrix — **DONE 2026-07-22**
+
+> **Resolved:** `docs/smtp_capability_matrix.md` (commands, per-channel
+> EHLO extensions, explicit not-supported list incl. SMTPUTF8 posture, and
+> every limit with its SMTP outcome), pinned by
+> `test/smtp_capability_test.rb` — doc and tests reference each other so
+> they can't drift silently.
+
+### 18) HA / horizontal scale — **DONE 2026-07-22 (doc)**
+
+> **Resolved:** README "Running more than one instance" section: stateless
+> daemon, N containers behind MX records / an L4 LB, no sticky sessions,
+> host app as the real SPOF, per-IP caps being per-instance, and the
+> per-deploy downtime window.
+
 ### 12) Anti-abuse: per-IP caps + auth throttling — **P0 — DONE 2026-07-22** *(absorbs #5, #8-auth)*
 
 > **Resolved:** `ConnLimiter` gained a per-IP concurrent-connection cap
@@ -502,10 +539,16 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
     2023-pinned `setup-ruby` that predates Ruby 4.0. Now runs `bin/test` +
     `rubocop --parallel` on `ruby/setup-ruby@v1` (repo is rubocop-clean).
 
-### Phase 3 — docs and polish (P2)
-11. **4** delivery-guarantees README section
-12. **17** `bin/healthcheck`
-13. **15** capability matrix doc
-14. **18** HA paragraph
-15. **1** DNS malformed-packet + end-to-end temperror tests
-16. **5** optional soak profile; **9** metrics hook when a consumer exists
+### Phase 3 — docs and polish (P2) — **COMPLETE 2026-07-22**
+11. ~~**4** delivery-guarantees README section~~ DONE
+12. ~~**17** `bin/healthcheck`~~ DONE
+13. ~~**15** capability matrix doc~~ DONE
+14. ~~**18** HA paragraph~~ DONE
+15. ~~**1** DNS malformed-packet + end-to-end temperror tests~~ DONE
+
+### Deliberately deferred (not scheduled)
+- **5** soak/load profile — revisit if real traffic exposes resource creep
+  the per-IP caps don't already bound.
+- **9** metrics emission — build when something consumes metrics; the
+  natural seam is a `store.count(event)`-style hook, since every
+  interesting path already calls the store.

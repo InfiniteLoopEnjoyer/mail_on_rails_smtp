@@ -1,0 +1,31 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Liveness probe for the SMTP daemon (wired as the Dockerfile HEALTHCHECK;
+# also usable from Kamal or by hand). Connects to the MX listener, reads
+# the banner, says QUIT. Exit 0 = serving, 1 = not.
+#
+# A 421 busy banner still counts as healthy: the process is up and
+# answering - it is full, and a restart would only drop the sessions
+# causing the fullness.
+
+require "socket"
+
+host = ENV.fetch("MAIL_ON_RAILS_HEALTHCHECK_HOST", "127.0.0.1")
+port = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_PORT", 1025))
+
+begin
+  Socket.tcp(host, port, connect_timeout: 5) do |socket|
+    socket.timeout = 5
+    banner = socket.gets("\r\n").to_s
+    unless banner.match?(/\A(220|421)[ -]/)
+      warn "[healthcheck] unexpected banner: #{banner.inspect}"
+      exit 1
+    end
+    socket.write("QUIT\r\n")
+    socket.gets("\r\n") # 221, best effort
+  end
+rescue StandardError => e
+  warn "[healthcheck] #{e.class}: #{e.message}"
+  exit 1
+end

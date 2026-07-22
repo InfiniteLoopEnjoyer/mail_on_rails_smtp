@@ -3,67 +3,16 @@
 require "test_helper"
 require "resolv"
 require "socket"
+require "fake_dns"
 require "mail_on_rails/smtp/sender_auth/dns"
 
 # The hand-rolled DNS transport (UDP + TCP-on-truncation over Resolv's wire
-# codec) against a scripted loopback nameserver. Network-flavored outcomes
-# (NXDOMAIN vs SERVFAIL vs timeout) are the point: the old Resolv-based
+# codec) against a scripted loopback nameserver (FakeDns, shared with the
+# end-to-end temperror suite). Network-flavored outcomes (NXDOMAIN vs
+# SERVFAIL vs timeout vs malformed) are the point: the old Resolv-based
 # client collapsed them all into "no record".
 class DnsTransportTest < Minitest::Test
   Dns = MailOnRails::Smtp::SenderAuth::Dns
-
-  # Scripted fake DNS server: answers each query via the block
-  # (query, reply, via) -> reply-ish; :drop swallows the query. A TCP
-  # listener on the same port serves the same block for truncation retries.
-  class FakeDns
-    attr_reader :port
-
-    def initialize(&responder)
-      @udp = UDPSocket.new
-      @udp.bind("127.0.0.1", 0)
-      @port = @udp.addr[1]
-      @tcp = TCPServer.new("127.0.0.1", @port)
-      @responder = responder
-      @threads = [ Thread.new { udp_loop }, Thread.new { tcp_loop } ]
-    end
-
-    def close
-      @threads.each(&:kill)
-      @udp.close
-      @tcp.close
-    end
-
-    private
-
-    def reply_bytes(data, via)
-      query = Resolv::DNS::Message.decode(data)
-      reply = Resolv::DNS::Message.new(query.id)
-      reply.qr = 1
-      query.each_question { |name, typeclass| reply.add_question(name, typeclass) }
-      result = @responder.call(query, reply, via)
-      return nil if result.equal?(:drop) # Message#== can't take a Symbol
-
-      result.is_a?(String) ? result : result.encode
-    end
-
-    def udp_loop
-      loop do
-        data, addr = @udp.recvfrom(4096)
-        bytes = reply_bytes(data, :udp)
-        @udp.send(bytes, 0, addr[3], addr[1]) if bytes
-      end
-    end
-
-    def tcp_loop
-      loop do
-        conn = @tcp.accept
-        length = conn.read(2).unpack1("n")
-        bytes = reply_bytes(conn.read(length), :tcp)
-        conn.write([ bytes.bytesize ].pack("n") + bytes) if bytes
-        conn.close
-      end
-    end
-  end
 
   def teardown
     @fake&.close
@@ -154,6 +103,37 @@ class DnsTransportTest < Minitest::Test
     assert_equal [ "2001:db8::7" ], dns.aaaa("mail.example.com")
     assert_equal [ "mail.example.com" ], dns.ptr("192.0.2.7")
     assert_empty dns.ptr("not-an-ip")
+  end
+
+  # -- malformed packets (todo item 1 residual) ------------------------------
+
+  test "a malformed udp reply raises TempError instead of crashing decode" do
+    dns = dns_with(timeout: 0.3) { |_q, _r, _via| "\x00\x01garbage that is not DNS".b }
+
+    assert_raises(Dns::TempError) { dns.txt("example.com") }
+  end
+
+  test "a malformed tcp reply after truncation raises TempError" do
+    dns = dns_with do |_query, reply, via|
+      if via == :udp
+        reply.tc = 1
+        reply
+      else
+        "these bytes decode as nothing".b
+      end
+    end
+
+    assert_raises(Dns::TempError) { dns.txt("example.com") }
+  end
+
+  test "a reply with a spoofed id is ignored, ending in TempError" do
+    dns = dns_with(timeout: 0.3) do |query, _reply, _via|
+      forged = Resolv::DNS::Message.new((query.id + 1) & 0xffff)
+      forged.qr = 1
+      forged
+    end
+
+    assert_raises(Dns::TempError) { dns.txt("example.com") }
   end
 
   test "unreachable nameserver raises TempError" do

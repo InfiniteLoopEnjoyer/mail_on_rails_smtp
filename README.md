@@ -4,7 +4,8 @@ A standalone SMTP server (RFC 5321 subset): MX + submission listeners with
 STARTTLS/implicit TLS, AUTH, SPF/DKIM/DMARC verification of inbound mail,
 and anti-abuse controls (global and per-IP connection caps, per-IP
 auth-failure lockout). Designed as the mail-receiving frontend for a
-Rails app.
+Rails app. The supported command/extension surface is documented in
+[docs/smtp_capability_matrix.md](docs/smtp_capability_matrix.md).
 
 The daemon holds **no database credentials and no Rails**: credential
 checks, recipient validation, and outbound queueing are HTTP calls to the
@@ -63,6 +64,44 @@ Companion repos:
   store and logger).
 - `bin/server` - foreground entrypoint the container runs.
 - `config/deploy.yml` - Kamal service definition.
+
+## Delivery guarantees
+
+There is **no local spool**: the only durable step is the HTTP handoff to
+the host app, and a message is never ACKed before that handoff succeeds.
+Concretely:
+
+- **App down / handoff fails** → the session answers a `4xx` temporary
+  failure and stores nothing; the *sending server's* queue is the retry
+  mechanism. This daemon never retries an HTTP call itself — a retry here
+  would only delay the sender's own retry signal and double-submit on
+  ambiguous failures.
+- **Disconnect mid-`DATA`** → nothing is stored (at-most-once before the
+  commit point).
+- **Overall semantics: at-least-once**, with two known duplicate windows:
+  a crash after the ingress accepted but before our `250` reached the
+  sender, and mixed local+remote recipients where outbound queueing
+  succeeds but the ingress then fails — the sender's retry queues the
+  outbound copies again. Both are pinned by tests; deduplication belongs
+  in the host app, where the queue lives.
+
+## Running more than one instance
+
+The daemon is stateless — accounts, recipients, and mail all live behind
+the host app's HTTP surfaces — so horizontal scale is just N containers
+with the same configuration:
+
+- Point multiple `MX` records (or an L4/TCP load balancer) at the
+  instances; no sticky sessions are needed, since every SMTP session is
+  self-contained on one connection.
+- The shared dependency and real single point of failure is the **host
+  app**; when it is down every instance answers temporary failures and
+  senders retry.
+- The per-IP caps and auth lockout are **per instance** (accept-side,
+  in-process). N instances multiply those thresholds accordingly.
+- Deploys have a few seconds of listener downtime per host
+  (`.kamal/hooks/pre-app-boot` stops the old container before the new one
+  binds the ports); sending servers retry, so mail is delayed, not lost.
 
 ## Host app requirements
 
