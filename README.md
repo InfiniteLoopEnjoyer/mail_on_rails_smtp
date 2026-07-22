@@ -46,7 +46,8 @@ formally experimental there.
 
 Companion repos:
 [mail_on_rails](https://github.com/InfiniteLoopEnjoyer/mail_on_rails)
-(the host Rails app — persistence, internal API, and web UI) and
+(the host Rails app — persistence, internal API, and web UI; see
+[The host app](#the-host-app-mail_on_rails) below) and
 [mail_on_rails_imap](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_imap)
 (the IMAP server).
 
@@ -102,6 +103,64 @@ with the same configuration:
 - Deploys have a few seconds of listener downtime per host
   (`.kamal/hooks/pre-app-boot` stops the old container before the new one
   binds the ports); sending servers retry, so mail is delayed, not lost.
+
+## The host app: mail_on_rails
+
+[mail_on_rails](https://github.com/InfiniteLoopEnjoyer/mail_on_rails) is
+the other half of the system: a Rails 8 app (Ruby 4.0, PostgreSQL,
+Solid Queue/Cache/Cable — no Redis) that owns persistence, the web UI,
+and outbound delivery. This daemon is deliberately ignorant of all of
+it, so for orientation, this is what sits on the far side of the HTTP
+calls:
+
+- **Domain model** — mail identities are `EmailAccount`s (unique
+  normalized email + bcrypt password: the credential SMTP AUTH checks),
+  each owning IMAP-style `Mailbox` folders (INBOX/Sent/Drafts/Trash/Junk
+  auto-provisioned) of `EmailMessage` rows: raw RFC822 bytes plus
+  extracted headers, IMAP flags/UIDs, and the verification verdicts this
+  daemon stamps. Web-console operators are a separate `User` model (an
+  admin login, not a mail identity). There are no domain or alias
+  tables — recipient locality is simply "an `EmailAccount` with this
+  address exists".
+- **The internal API, server-side** (`InternalController`, basic auth):
+  `authenticate` runs `EmailAccount.authenticate_by`, returning null
+  fields on bad credentials (HTTP 200; a 401 means the *API password* is
+  wrong). `rcpt_check` normalizes (strip/downcase/dedup) and returns the
+  subset that are existing accounts. `outbound_messages` inserts one
+  `SmtpOutboundMessage` row **per remote recipient**, all-or-nothing,
+  answering 507 when the pending queue would exceed
+  `MAIL_ON_RAILS_OUTBOUND_LIMIT` (default 1000) — which this daemon
+  relays to the client as a `452`.
+- **Inbound, after the ingress** — Action Mailbox (`:relay` mode) routes
+  every accepted message to a single `MailroomMailbox`, which resolves
+  recipients from To/Cc/Bcc plus our stamped `X-Original-To` and files
+  the message into each local account's INBOX. Our
+  `X-MailOnRails-Authenticated` / `X-MailOnRails-Auth-Results` headers
+  become the stored message's `authenticated_as` / `auth_results`
+  columns, surfaced as sender-verification badges in the UI.
+- **Outbound delivery** — a Solid Queue recurring job (in-process in
+  Puma) drains the queue every 15 seconds: rows are claimed atomically
+  (`pending` → `delivering`) so concurrent runs can't double-send, MX is
+  resolved per recipient (RFC 7505 null-MX honored), delivery goes out
+  on port 25 with opportunistic STARTTLS (or through a configured
+  smarthost), messages are DKIM-signed with per-domain keys
+  (`MAIL_ON_RAILS_DKIM_DIR/<domain>.pem`), and transient failures retry
+  on a backoff schedule spanning ~22 hours before a minimal DSN bounce
+  is delivered into the sender's INBOX.
+- **Web UI** — a server-rendered admin console (Hotwire + Tailwind):
+  manage accounts and folders, read messages with their verification
+  badges. It is not a compose-and-send webmail; sending happens through
+  real mail clients submitting to this daemon.
+- **IMAP** — the same internal API also carries an IMAP store contract
+  (`imap/:op` endpoints backed by `Store::ImapBackend`) consumed by
+  [mail_on_rails_imap](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_imap) —
+  the same no-database-in-the-daemon privilege split used here (the IMAP
+  daemon cannot touch the outbound spool; this daemon cannot read
+  mailboxes).
+
+In development the app runs all three services in one process (the
+daemons are path gems mounted as Puma plugins via its `bin/dev`); in
+production each is its own Kamal service against the app's PostgreSQL.
 
 ## Host app requirements
 
