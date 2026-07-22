@@ -3,6 +3,7 @@
 require "net/http"
 require "uri"
 require "logger"
+require_relative "http_pool"
 
 module MailOnRails
   module Smtp
@@ -29,6 +30,7 @@ module MailOnRails
         @uri = URI(url)
         @password = password
         @logger = logger
+        @pool = HttpPool.new(@uri, open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT)
       end
 
       # POSTs the stamped message; true when the app accepted it. Non-2xx
@@ -36,14 +38,11 @@ module MailOnRails
       # store adapter turns the failure into a 451 so the sending server
       # retries later.
       def deliver(source)
-        response = Net::HTTP.start(@uri.host, @uri.port, use_ssl: @uri.scheme == "https",
-                                   open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
-          request = Net::HTTP::Post.new(@uri)
-          request.basic_auth("actionmailbox", @password.to_s)
-          request.content_type = "message/rfc822"
-          request.body = source
-          http.request(request)
-        end
+        request = Net::HTTP::Post.new(@uri)
+        request.basic_auth("actionmailbox", @password.to_s)
+        request.content_type = "message/rfc822"
+        request.body = source
+        response = @pool.request(request)
 
         @logger.warn "[mail_on_rails] ingress refused message: #{response.code}" unless response.is_a?(Net::HTTPSuccess)
         response.is_a?(Net::HTTPSuccess)

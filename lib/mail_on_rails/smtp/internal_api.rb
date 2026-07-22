@@ -3,6 +3,7 @@
 require "net/http"
 require "json"
 require "uri"
+require_relative "http_pool"
 
 module MailOnRails
   module Smtp
@@ -32,8 +33,7 @@ module MailOnRails
                      open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT)
         @base = URI(url.to_s.chomp("/"))
         @password = password
-        @open_timeout = open_timeout
-        @read_timeout = read_timeout
+        @pool = HttpPool.new(@base, open_timeout: open_timeout, read_timeout: read_timeout)
       end
 
       # => { account_id:, email: } (both nil on bad credentials)
@@ -85,10 +85,7 @@ module MailOnRails
       def perform(request)
         # The basic-auth username is fixed by the app's controller.
         request.basic_auth("mail_on_rails", @password.to_s)
-        Net::HTTP.start(@base.host, @base.port, use_ssl: @base.scheme == "https",
-                        open_timeout: @open_timeout, read_timeout: @read_timeout) do |http|
-          http.request(request)
-        end
+        @pool.request(request)
       end
 
       def default_url

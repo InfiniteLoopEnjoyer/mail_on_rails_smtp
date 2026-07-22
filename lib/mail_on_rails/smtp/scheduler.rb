@@ -217,7 +217,7 @@ module MailOnRails
       def select_args
         interval = nil
         unless @timers.empty?
-          interval = @timers.map(&:deadline).min - now
+          interval = @timers.min_by(&:deadline).deadline - now
           interval = 0 if interval.negative?
         end
         [ @readable.keys + [ @wake_r ], @writable.keys, interval ]
