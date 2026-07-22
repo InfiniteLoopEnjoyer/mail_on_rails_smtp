@@ -39,10 +39,10 @@ module MailOnRails
       class Dns
         class TempError < StandardError; end
 
-        TIMEOUT = Config.int("MAIL_ON_RAILS_DNS_TIMEOUT", 5, min: 1)
+        TIMEOUT = Config.int("SMTP_DNS_TIMEOUT", 5, min: 1)
         # Cap in seconds on how long an answer is cached (the records' own
         # TTLs bind below it); 0 disables caching.
-        CACHE_TTL = Config.int("MAIL_ON_RAILS_DNS_CACHE_TTL", 60)
+        CACHE_TTL = Config.int("SMTP_DNS_CACHE_TTL", 60)
         SWEEP_THRESHOLD = 10_000 # purge expired answers when the cache grows past this
         PORT = 53
         MAX_UDP = 4096

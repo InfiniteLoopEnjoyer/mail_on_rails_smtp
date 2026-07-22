@@ -55,7 +55,7 @@ module MailOnRails
       # per-listener spec[:sender_auth] overrides it (the test seam). On by
       # default - only "0" disables - for local try-outs where live DNS
       # lookups per message are unwanted.
-      ENABLED = ENV["MAIL_ON_RAILS_SENDER_AUTH"] != "0"
+      ENABLED = ENV["SMTP_SENDER_AUTH"] != "0"
 
       def self.enabled? = ENABLED
 
@@ -63,7 +63,7 @@ module MailOnRails
       # verdicts are recorded either way, and flipping this on should wait
       # until the verifiers have proven themselves against real traffic.
       def self.enforce_dmarc?
-        ENV["MAIL_ON_RAILS_DMARC_ENFORCE"] == "1"
+        ENV["SMTP_DMARC_ENFORCE"] == "1"
       end
 
       def self.verify(ip:, helo:, mail_from:, data:, resolver: Dns.shared)

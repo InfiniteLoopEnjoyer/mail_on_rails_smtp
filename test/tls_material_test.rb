@@ -14,7 +14,7 @@ require "mail_on_rails/smtp/daemon"
 # path stays forgiving.
 class TlsMaterialTest < Minitest::Test
   TLS = MailOnRails::Smtp::TLS
-  ENV_KEYS = %w[MAIL_ON_RAILS_TLS_CERT MAIL_ON_RAILS_TLS_KEY].freeze
+  ENV_KEYS = %w[SMTP_TLS_CERT SMTP_TLS_KEY].freeze
 
   def setup
     @saved_env = ENV_KEYS.to_h { |k| [ k, ENV.delete(k) ] }
@@ -42,16 +42,16 @@ class TlsMaterialTest < Minitest::Test
 
   test "explicit cert and key paths load and are returned as path material" do
     with_valid_pems do |cert, key, _dir|
-      ENV["MAIL_ON_RAILS_TLS_CERT"] = cert
-      ENV["MAIL_ON_RAILS_TLS_KEY"] = key
+      ENV["SMTP_TLS_CERT"] = cert
+      ENV["SMTP_TLS_KEY"] = key
 
       assert_equal({ cert_path: cert, key_path: key }, TLS.material(logger: null_logger))
     end
   end
 
   test "explicit paths that do not exist are fatal" do
-    ENV["MAIL_ON_RAILS_TLS_CERT"] = "/nonexistent/fullchain.pem"
-    ENV["MAIL_ON_RAILS_TLS_KEY"] = "/nonexistent/privkey.pem"
+    ENV["SMTP_TLS_CERT"] = "/nonexistent/fullchain.pem"
+    ENV["SMTP_TLS_KEY"] = "/nonexistent/privkey.pem"
 
     error = assert_raises(TLS::Error) { TLS.material(logger: null_logger) }
     assert_match(/fullchain\.pem/, error.message, "the message must name the bad path")
@@ -61,8 +61,8 @@ class TlsMaterialTest < Minitest::Test
     with_valid_pems do |_cert, key, dir|
       garbage = File.join(dir, "garbage.pem")
       File.write(garbage, "not a pem")
-      ENV["MAIL_ON_RAILS_TLS_CERT"] = garbage
-      ENV["MAIL_ON_RAILS_TLS_KEY"] = key
+      ENV["SMTP_TLS_CERT"] = garbage
+      ENV["SMTP_TLS_KEY"] = key
 
       assert_raises(TLS::Error) { TLS.material(logger: null_logger) }
     end
@@ -72,15 +72,15 @@ class TlsMaterialTest < Minitest::Test
     with_valid_pems do |cert, _key, dir|
       other_key = File.join(dir, "other.key")
       File.write(other_key, TLS.generate_self_signed[:key])
-      ENV["MAIL_ON_RAILS_TLS_CERT"] = cert
-      ENV["MAIL_ON_RAILS_TLS_KEY"] = other_key
+      ENV["SMTP_TLS_CERT"] = cert
+      ENV["SMTP_TLS_KEY"] = other_key
 
       assert_raises(TLS::Error) { TLS.material(logger: null_logger) }
     end
   end
 
   test "setting only one of cert or key is fatal, not a silent self-signed fallback" do
-    ENV["MAIL_ON_RAILS_TLS_CERT"] = "/some/fullchain.pem"
+    ENV["SMTP_TLS_CERT"] = "/some/fullchain.pem"
 
     error = assert_raises(TLS::Error) { TLS.material(logger: null_logger) }
     assert_match(/set together/, error.message)
@@ -100,8 +100,8 @@ class TlsMaterialTest < Minitest::Test
   end
 
   test "daemon refuses to start on broken explicit TLS config" do
-    ENV["MAIL_ON_RAILS_TLS_CERT"] = "/nonexistent/fullchain.pem"
-    ENV["MAIL_ON_RAILS_TLS_KEY"] = "/nonexistent/privkey.pem"
+    ENV["SMTP_TLS_CERT"] = "/nonexistent/fullchain.pem"
+    ENV["SMTP_TLS_KEY"] = "/nonexistent/privkey.pem"
     logs = StringIO.new
 
     error = assert_raises(SystemExit) do

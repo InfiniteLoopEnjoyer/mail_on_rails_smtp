@@ -78,7 +78,7 @@ module MailOnRails
       # A 401 is a configuration error, not weather - say so in the log line
       # instead of leaving it indistinguishable from an app-side 5xx.
       def describe(response)
-        hint = response.is_a?(Net::HTTPUnauthorized) ? " (check MAIL_ON_RAILS_INTERNAL_API_PASSWORD)" : ""
+        hint = response.is_a?(Net::HTTPUnauthorized) ? " (check SMTP_INTERNAL_API_PASSWORD)" : ""
         "#{response.code}#{hint}"
       end
 
@@ -89,13 +89,13 @@ module MailOnRails
       end
 
       def default_url
-        ENV.fetch("MAIL_ON_RAILS_INTERNAL_API_URL") { "http://127.0.0.1:3000/mail_on_rails/internal" }
+        ENV.fetch("SMTP_INTERNAL_API_URL") { "http://127.0.0.1:3000/mail_on_rails/internal" }
       end
 
       # The host app's internal API password, handed to this daemon as an
       # environment secret.
       def default_password
-        ENV["MAIL_ON_RAILS_INTERNAL_API_PASSWORD"]
+        ENV["SMTP_INTERNAL_API_PASSWORD"]
       end
     end
   end

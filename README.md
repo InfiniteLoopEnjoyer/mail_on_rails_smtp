@@ -179,30 +179,30 @@ surfaces:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MAIL_ON_RAILS_INTERNAL_API_URL` | `http://127.0.0.1:3000/mail_on_rails/internal` | App's private API |
-| `MAIL_ON_RAILS_INTERNAL_API_PASSWORD` | - | Basic-auth password for it |
-| `MAIL_ON_RAILS_INGRESS_URL` | `http://127.0.0.1:3000/rails/action_mailbox/relay/inbound_emails` | Action Mailbox relay ingress |
-| `MAIL_ON_RAILS_INGRESS_PASSWORD` | `$RAILS_INBOUND_EMAIL_PASSWORD` | Ingress password |
-| `MAIL_ON_RAILS_HOST` | `0.0.0.0` | Bind address |
-| `MAIL_ON_RAILS_SMTP_PORT` / `_SMTP_SUBMISSION_PORT` / `_SMTPS_PORT` | `1025` / `1587` / `1465` | Listener ports |
-| `MAIL_ON_RAILS_HELO_HOST` | hostname | Banner/EHLO name |
-| `MAIL_ON_RAILS_TLS_CERT` / `_TLS_KEY` | - | PEM paths; if set but missing/unloadable the daemon refuses to boot (else self-signed under `MAIL_ON_RAILS_TLS_DIR`, default `storage/tls`) |
-| `MAIL_ON_RAILS_TLS_HOSTS` | `localhost` | Comma-separated SANs for the self-signed cert (hostname is always added) |
-| `MAIL_ON_RAILS_SENDER_AUTH` | on | `0` skips SPF/DKIM/DMARC verification entirely (local try-outs; mail is stored without a verdict) |
-| `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
-| `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
-| `MAIL_ON_RAILS_DNS_CACHE_TTL` | `60` | Cap in seconds on the per-worker DNS answer cache (record TTLs bind below it; `0` disables) |
-| `MAIL_ON_RAILS_RBLS` | - | Comma-separated DNSBL zones (e.g. `zen.spamhaus.org`); unauthenticated MX mail from a listed IP is refused at `MAIL FROM` with `554 5.7.1`. Fails open on DNS trouble |
-| `MAIL_ON_RAILS_RBL_CACHE_TTL` | `600` | Seconds a DNSBL verdict is cached per peer IP |
-| `MAIL_ON_RAILS_SMTP_MAX_CONN` | `100` | Connection cap |
-| `MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP` | `10` | Concurrent connections per peer IP (`0` disables) |
-| `MAIL_ON_RAILS_SMTP_CONN_RATE` | `60` | Connections per peer IP per window before the banner is tarpitted (escalating 1 s → 16 s; loopback exempt; `0` disables) |
-| `MAIL_ON_RAILS_SMTP_CONN_RATE_WINDOW` | `60` | Sliding-window seconds for the connection rate |
-| `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES` | `10` | Failed AUTHs per IP before lockout (`0` disables) |
-| `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS` | `900` | Lockout duration; also the failure-decay window |
-| `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
-| `MAIL_ON_RAILS_SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
-| `MAIL_ON_RAILS_SMTP_TRACE` | off | `1` debug-logs the protocol exchange (credentials redacted, DATA payloads omitted) |
+| `SMTP_INTERNAL_API_URL` | `http://127.0.0.1:3000/mail_on_rails/internal` | App's private API |
+| `SMTP_INTERNAL_API_PASSWORD` | - | Basic-auth password for it |
+| `SMTP_INGRESS_URL` | `http://127.0.0.1:3000/rails/action_mailbox/relay/inbound_emails` | Action Mailbox relay ingress |
+| `SMTP_INGRESS_PASSWORD` | `$RAILS_INBOUND_EMAIL_PASSWORD` | Ingress password |
+| `SMTP_HOST` | `0.0.0.0` | Bind address |
+| `SMTP_PORT` / `_SMTP_SUBMISSION_PORT` / `_SMTPS_PORT` | `1025` / `1587` / `1465` | Listener ports |
+| `SMTP_HELO_HOST` | hostname | Banner/EHLO name |
+| `SMTP_TLS_CERT` / `_TLS_KEY` | - | PEM paths; if set but missing/unloadable the daemon refuses to boot (else self-signed under `SMTP_TLS_DIR`, default `storage/tls`) |
+| `SMTP_TLS_HOSTS` | `localhost` | Comma-separated SANs for the self-signed cert (hostname is always added) |
+| `SMTP_SENDER_AUTH` | on | `0` skips SPF/DKIM/DMARC verification entirely (local try-outs; mail is stored without a verdict) |
+| `SMTP_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
+| `SMTP_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
+| `SMTP_DNS_CACHE_TTL` | `60` | Cap in seconds on the per-worker DNS answer cache (record TTLs bind below it; `0` disables) |
+| `SMTP_RBLS` | - | Comma-separated DNSBL zones (e.g. `zen.spamhaus.org`); unauthenticated MX mail from a listed IP is refused at `MAIL FROM` with `554 5.7.1`. Fails open on DNS trouble |
+| `SMTP_RBL_CACHE_TTL` | `600` | Seconds a DNSBL verdict is cached per peer IP |
+| `SMTP_MAX_CONN` | `100` | Connection cap |
+| `SMTP_MAX_CONN_PER_IP` | `10` | Concurrent connections per peer IP (`0` disables) |
+| `SMTP_CONN_RATE` | `60` | Connections per peer IP per window before the banner is tarpitted (escalating 1 s → 16 s; loopback exempt; `0` disables) |
+| `SMTP_CONN_RATE_WINDOW` | `60` | Sliding-window seconds for the connection rate |
+| `SMTP_AUTH_LOCKOUT_FAILURES` | `10` | Failed AUTHs per IP before lockout (`0` disables) |
+| `SMTP_AUTH_LOCKOUT_SECONDS` | `900` | Lockout duration; also the failure-decay window |
+| `SMTP_WORKERS` | CPU cores | Session worker count |
+| `SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
+| `SMTP_TRACE` | off | `1` debug-logs the protocol exchange (credentials redacted, DATA payloads omitted) |
 
 ### Feature switches
 
@@ -219,21 +219,21 @@ to know before flipping anything:
 
 | Feature | Variable | Default | Off when | On when |
 | --- | --- | --- | --- | --- |
-| SPF/DKIM/DMARC verification | `MAIL_ON_RAILS_SENDER_AUTH` | **on** | `0` | anything else / unset |
-| DMARC enforcement (reject on `p=reject` fail) | `MAIL_ON_RAILS_DMARC_ENFORCE` | **off** (record-only) | unset / anything else | `1` |
-| DNSBL (RBL) checks | `MAIL_ON_RAILS_RBLS` | **off** | unset / empty | one or more zones, e.g. `zen.spamhaus.org` |
-| ClamAV virus scanning | `MAIL_ON_RAILS_CLAMAV_ADDR` | **off** | unset / empty | `host[:port]` of a clamd daemon |
-| Per-IP concurrent connection cap | `MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP` | **on** (10) | `0` | any positive cap |
-| Per-IP connection rate tarpit | `MAIL_ON_RAILS_SMTP_CONN_RATE` | **on** (60/window) | `0` | any positive budget |
-| Per-IP auth-failure lockout | `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES` | **on** (10) | `0` | any positive threshold |
-| Protocol tracing | `MAIL_ON_RAILS_SMTP_TRACE` | **off** | unset / anything else | `1` |
-| Ractor workers | `MAIL_ON_RAILS_SMTP_WORKER_MODE` | **auto** | `thread` (plain threads) | `auto` / unset |
+| SPF/DKIM/DMARC verification | `SMTP_SENDER_AUTH` | **on** | `0` | anything else / unset |
+| DMARC enforcement (reject on `p=reject` fail) | `SMTP_DMARC_ENFORCE` | **off** (record-only) | unset / anything else | `1` |
+| DNSBL (RBL) checks | `SMTP_RBLS` | **off** | unset / empty | one or more zones, e.g. `zen.spamhaus.org` |
+| ClamAV virus scanning | `SMTP_CLAMAV_ADDR` | **off** | unset / empty | `host[:port]` of a clamd daemon |
+| Per-IP concurrent connection cap | `SMTP_MAX_CONN_PER_IP` | **on** (10) | `0` | any positive cap |
+| Per-IP connection rate tarpit | `SMTP_CONN_RATE` | **on** (60/window) | `0` | any positive budget |
+| Per-IP auth-failure lockout | `SMTP_AUTH_LOCKOUT_FAILURES` | **on** (10) | `0` | any positive threshold |
+| Protocol tracing | `SMTP_TRACE` | **off** | unset / anything else | `1` |
+| Ractor workers | `SMTP_WORKER_MODE` | **auto** | `thread` (plain threads) | `auto` / unset |
 
-The global connection cap (`MAIL_ON_RAILS_SMTP_MAX_CONN`) cannot be
-disabled, only raised. Setting `MAIL_ON_RAILS_SENDER_AUTH=0` stores
+The global connection cap (`SMTP_MAX_CONN`) cannot be
+disabled, only raised. Setting `SMTP_SENDER_AUTH=0` stores
 inbound mail with no verdict (`auth_results` empty) and makes DMARC
 enforcement moot; `--check-config` warns when it is off. Pointing
-`MAIL_ON_RAILS_CLAMAV_ADDR` at an unreachable clamd tempfails (`451`)
+`SMTP_CLAMAV_ADDR` at an unreachable clamd tempfails (`451`)
 rather than letting mail skip scanning — only set it for a daemon you
 intend to keep running.
 
@@ -278,7 +278,7 @@ A message that fails DMARC under a published `p=reject` policy is still
 verifier bug should not bounce legitimate mail while the implementation is
 young. Once the logs look right against real traffic, enable rejection with:
 
-    MAIL_ON_RAILS_DMARC_ENFORCE=1
+    SMTP_DMARC_ENFORCE=1
 
 With enforcement on, such messages are refused at SMTP time with
 `550 5.7.1 Rejected per DMARC policy of <domain>`.
@@ -295,11 +295,11 @@ verifiers record `temperror` verdicts, so a DNS outage is visible in
 `none`.
 
 Answers (including "no record") are cached per worker for up to
-`MAIL_ON_RAILS_DNS_CACHE_TTL` seconds (default 60; record TTLs bind below
+`SMTP_DNS_CACHE_TTL` seconds (default 60; record TTLs bind below
 the cap, failures are never cached), so a burst of messages from one
 sender costs one fetch of its SPF/DKIM/DMARC records, not one per message.
 The DNSBL checks reuse the same client and add their own per-IP verdict
-cache (`MAIL_ON_RAILS_RBL_CACHE_TTL`).
+cache (`SMTP_RBL_CACHE_TTL`).
 
 ## Test / run
 

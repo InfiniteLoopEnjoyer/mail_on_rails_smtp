@@ -8,7 +8,7 @@ module MailOnRails
   module Smtp
     # DNSBL (RBL) checks for unauthenticated MX traffic: reverse the peer
     # IP's octets (nibbles for IPv6), append a configured blocklist zone
-    # (MAIL_ON_RAILS_RBLS, comma/space separated, e.g. "zen.spamhaus.org"),
+    # (SMTP_RBLS, comma/space separated, e.g. "zen.spamhaus.org"),
     # and A-query it. An answer inside 127.0.0.0/8 means "listed" (RFC
     # 5782); the session then refuses the MAIL FROM.
     #
@@ -23,8 +23,8 @@ module MailOnRails
     class Dnsbl
       # Parsed at load (worker Ractors cannot read ENV at runtime) and
       # shareable so worker Ractors can read it. Empty means disabled.
-      ZONES = Ractor.make_shareable(ENV["MAIL_ON_RAILS_RBLS"].to_s.split(/[\s,]+/).reject(&:empty?))
-      CACHE_TTL = Config.int("MAIL_ON_RAILS_RBL_CACHE_TTL", 600, min: 1)
+      ZONES = Ractor.make_shareable(ENV["SMTP_RBLS"].to_s.split(/[\s,]+/).reject(&:empty?))
+      CACHE_TTL = Config.int("SMTP_RBL_CACHE_TTL", 600, min: 1)
       SWEEP_THRESHOLD = 10_000 # purge expired verdicts when the cache grows past this
 
       # The calling thread's checker, or nil when no zones are configured.

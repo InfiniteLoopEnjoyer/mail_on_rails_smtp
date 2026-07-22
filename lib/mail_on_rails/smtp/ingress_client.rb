@@ -72,13 +72,13 @@ module MailOnRails
       private
 
       def default_url
-        ENV.fetch("MAIL_ON_RAILS_INGRESS_URL") { "http://127.0.0.1:3000/rails/action_mailbox/relay/inbound_emails" }
+        ENV.fetch("SMTP_INGRESS_URL") { "http://127.0.0.1:3000/rails/action_mailbox/relay/inbound_emails" }
       end
 
       # The app's credentials value (action_mailbox.ingress_password);
       # RAILS_INBOUND_EMAIL_PASSWORD is Action Mailbox's own env spelling.
       def default_password
-        ENV["MAIL_ON_RAILS_INGRESS_PASSWORD"] || ENV["RAILS_INBOUND_EMAIL_PASSWORD"]
+        ENV["SMTP_INGRESS_PASSWORD"] || ENV["RAILS_INBOUND_EMAIL_PASSWORD"]
       end
 
       # Drops CR/LF so an envelope value can't inject extra header lines.

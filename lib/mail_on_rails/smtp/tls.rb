@@ -8,7 +8,7 @@ module MailOnRails
   module Smtp
     # TLS material for the SMTP/IMAP servers.
     #
-    # In production, point MAIL_ON_RAILS_TLS_CERT / MAIL_ON_RAILS_TLS_KEY at real PEM
+    # In production, point SMTP_TLS_CERT / SMTP_TLS_KEY at real PEM
     # files (e.g. from Let's Encrypt). In development, a self-signed cert is
     # generated once and cached under storage/tls so it stays stable across
     # restarts (a changing cert would re-trigger the iOS "untrusted" prompt).
@@ -27,7 +27,7 @@ module MailOnRails
       module_function
 
       # Returns TLS material (a Hash of plain strings) or nil if TLS can't be
-      # provisioned. When MAIL_ON_RAILS_TLS_CERT/KEY are set, returns
+      # provisioned. When SMTP_TLS_CERT/KEY are set, returns
       # { cert_path:, key_path: } so each server re-reads the files when the
       # cert is renewed (see ContextProvider) - and raises Error when they
       # are missing or unusable: explicitly configured TLS must never
@@ -38,8 +38,8 @@ module MailOnRails
       # stays free of Rails (the store contract in the main mail_on_rails
       # app repo follows the same principle on the storage side).
       def material(dir: nil, logger: nil)
-        cert_path = ENV["MAIL_ON_RAILS_TLS_CERT"]
-        key_path = ENV["MAIL_ON_RAILS_TLS_KEY"]
+        cert_path = ENV["SMTP_TLS_CERT"]
+        key_path = ENV["SMTP_TLS_KEY"]
         return explicit_material(cert_path, key_path) if cert_path || key_path
 
         begin
@@ -53,7 +53,7 @@ module MailOnRails
       # Explicit cert/key configuration: any problem is a fatal Error.
       def explicit_material(cert_path, key_path)
         unless cert_path && key_path
-          raise Error, "MAIL_ON_RAILS_TLS_CERT and MAIL_ON_RAILS_TLS_KEY must be set together"
+          raise Error, "SMTP_TLS_CERT and SMTP_TLS_KEY must be set together"
         end
 
         begin
@@ -65,7 +65,7 @@ module MailOnRails
       end
 
       def load_or_generate_self_signed(dir, logger)
-        raise ArgumentError, "MAIL_ON_RAILS_TLS_CERT/KEY unset and no self-signed dir given" unless dir
+        raise ArgumentError, "SMTP_TLS_CERT/KEY unset and no self-signed dir given" unless dir
 
         cert_file = File.join(dir, "selfsigned.crt")
         key_file = File.join(dir, "selfsigned.key")
@@ -108,7 +108,7 @@ module MailOnRails
       end
 
       def hostnames
-        hosts = ENV.fetch("MAIL_ON_RAILS_TLS_HOSTS", "localhost").split(",").map(&:strip)
+        hosts = ENV.fetch("SMTP_TLS_HOSTS", "localhost").split(",").map(&:strip)
         hosts << Socket.gethostname
         hosts.reject(&:empty?).uniq
       end

@@ -44,32 +44,32 @@ env:
     # HTTP credentials for the calls to the app, from the gitignored .env
     # (see .kamal/secrets-common). Deliberately NO RAILS_MASTER_KEY and NO
     # database env in this container.
-    - MAIL_ON_RAILS_INTERNAL_API_PASSWORD
-    - MAIL_ON_RAILS_INGRESS_PASSWORD
+    - SMTP_INTERNAL_API_PASSWORD
+    - SMTP_INGRESS_PASSWORD
   clear:
     # TLS material for the listeners (e.g. Let's Encrypt). Renewals are
     # picked up live - the servers re-read the files when their mtimes
     # change (TLS::ContextProvider), no restart needed.
-    MAIL_ON_RAILS_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
-    MAIL_ON_RAILS_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
+    SMTP_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
+    SMTP_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
 
     # SMTP banner/EHLO name; must match this host's public mail name (and
     # ideally its PTR record).
-    MAIL_ON_RAILS_HELO_HOST: mail.example.com
+    SMTP_HELO_HOST: mail.example.com
 
     # Accepted inbound mail is POSTed to the app's Action Mailbox relay
     # ingress; credential/recipient checks and outbound queueing go to the
     # private API. If the app is down the session answers a temporary
     # failure and the sending server retries.
-    MAIL_ON_RAILS_INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
-    MAIL_ON_RAILS_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
+    SMTP_INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
+    SMTP_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
 
     # clamd, the app repo's "clamav" Kamal accessory, reached by container
     # name over the shared "kamal" docker network (both services deploy to
     # the same host). Infected DATA answers 550 (plus a quarantined review
     # copy via the ingress); scanner down answers 451 so senders retry.
     # Unset to disable scanning at SMTP time.
-    MAIL_ON_RAILS_CLAMAV_ADDR: mail_on_rails-clamav:3310
+    SMTP_CLAMAV_ADDR: mail_on_rails-clamav:3310
 
 aliases:
   logs: app logs -f

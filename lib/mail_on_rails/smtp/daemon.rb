@@ -42,9 +42,9 @@ module MailOnRails
       # true when bootable; fatal problems log an error and return false,
       # suspicious-but-runnable settings log warnings.
       def check_config(logger: default_logger)
-        host = ENV.fetch("MAIL_ON_RAILS_HOST", "0.0.0.0")
+        host = ENV.fetch("SMTP_HOST", "0.0.0.0")
         specs = listeners(host)
-        tls = TLS.material(dir: ENV.fetch("MAIL_ON_RAILS_TLS_DIR", "storage/tls"), logger: logger)
+        tls = TLS.material(dir: ENV.fetch("SMTP_TLS_DIR", "storage/tls"), logger: logger)
         config_warnings(logger)
         tls_summary = tls ? (tls[:cert_path] ? "from #{tls[:cert_path]}" : "self-signed") : "UNAVAILABLE (plaintext only)"
         logger.info "[mail_on_rails] config OK: ports #{specs.map { |s| s[:port] }.join("/")} on #{host}, " \
@@ -58,30 +58,30 @@ module MailOnRails
       # Settings that are legal but almost certainly not what the operator
       # meant - each has caused (or would cause) a quiet runtime failure.
       def config_warnings(logger)
-        if ENV["MAIL_ON_RAILS_INTERNAL_API_PASSWORD"].to_s.empty?
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_INTERNAL_API_PASSWORD is not set - " \
+        if ENV["SMTP_INTERNAL_API_PASSWORD"].to_s.empty?
+          logger.warn "[mail_on_rails] SMTP_INTERNAL_API_PASSWORD is not set - " \
                       "the app will refuse credential and recipient checks"
         end
-        if ENV["MAIL_ON_RAILS_INGRESS_PASSWORD"].to_s.empty? && ENV["RAILS_INBOUND_EMAIL_PASSWORD"].to_s.empty?
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_INGRESS_PASSWORD is not set - " \
+        if ENV["SMTP_INGRESS_PASSWORD"].to_s.empty? && ENV["RAILS_INBOUND_EMAIL_PASSWORD"].to_s.empty?
+          logger.warn "[mail_on_rails] SMTP_INGRESS_PASSWORD is not set - " \
                       "the app will refuse inbound mail"
         end
-        mode = ENV["MAIL_ON_RAILS_SMTP_WORKER_MODE"]
+        mode = ENV["SMTP_WORKER_MODE"]
         if mode && !%w[thread auto].include?(mode)
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SMTP_WORKER_MODE=#{mode} is not recognized " \
+          logger.warn "[mail_on_rails] SMTP_WORKER_MODE=#{mode} is not recognized " \
                       "(\"thread\" or \"auto\") - treating as auto"
         end
-        enforce = ENV["MAIL_ON_RAILS_DMARC_ENFORCE"]
+        enforce = ENV["SMTP_DMARC_ENFORCE"]
         if enforce && enforce != "1" && enforce.match?(/\A(true|yes|on|enabled)\z/i)
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_DMARC_ENFORCE=#{enforce} does NOT enable " \
+          logger.warn "[mail_on_rails] SMTP_DMARC_ENFORCE=#{enforce} does NOT enable " \
                       "enforcement - only \"1\" does"
         end
-        sender_auth = ENV["MAIL_ON_RAILS_SENDER_AUTH"]
+        sender_auth = ENV["SMTP_SENDER_AUTH"]
         if sender_auth == "0"
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SENDER_AUTH=0 - inbound mail is accepted " \
+          logger.warn "[mail_on_rails] SMTP_SENDER_AUTH=0 - inbound mail is accepted " \
                       "without SPF/DKIM/DMARC verification"
         elsif sender_auth && sender_auth.match?(/\A(false|no|off|disabled)\z/i)
-          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SENDER_AUTH=#{sender_auth} does NOT disable " \
+          logger.warn "[mail_on_rails] SMTP_SENDER_AUTH=#{sender_auth} does NOT disable " \
                       "verification - only \"0\" does"
         end
       end
@@ -91,9 +91,9 @@ module MailOnRails
       # is fatal (run! exits, an embedding web process carries on).
       def start(logger: default_logger, store: nil, host: nil, tls_dir: nil)
         store ||= Store::Http.new(logger: logger)
-        host ||= ENV.fetch("MAIL_ON_RAILS_HOST", "0.0.0.0")
+        host ||= ENV.fetch("SMTP_HOST", "0.0.0.0")
         specs = listeners(host)
-        tls = tls_material(logger, tls_dir || ENV.fetch("MAIL_ON_RAILS_TLS_DIR", "storage/tls"))
+        tls = tls_material(logger, tls_dir || ENV.fetch("SMTP_TLS_DIR", "storage/tls"))
 
         logger.info "[mail_on_rails] SMTP #{specs.map { |s| s[:port] }.join("/")} on #{host}"
         Thread.new do
@@ -107,11 +107,11 @@ module MailOnRails
       def listeners(host)
         # Announced in the SMTP banner/EHLO (RFC 5321 wants our FQDN; spam
         # filters compare it to the PTR).
-        hostname = ENV.fetch("MAIL_ON_RAILS_HELO_HOST") { Socket.gethostname }
+        hostname = ENV.fetch("SMTP_HELO_HOST") { Socket.gethostname }
         specs = [
-          { host: host, port: env_port("MAIL_ON_RAILS_SMTP_PORT", 1025), tls: :starttls, role: :mx, hostname: hostname },
-          { host: host, port: env_port("MAIL_ON_RAILS_SMTP_SUBMISSION_PORT", 1587), tls: :starttls, role: :submission, hostname: hostname },
-          { host: host, port: env_port("MAIL_ON_RAILS_SMTPS_PORT", 1465), tls: :implicit, role: :submission, hostname: hostname }
+          { host: host, port: env_port("SMTP_PORT", 1025), tls: :starttls, role: :mx, hostname: hostname },
+          { host: host, port: env_port("SMTP_SUBMISSION_PORT", 1587), tls: :starttls, role: :submission, hostname: hostname },
+          { host: host, port: env_port("SMTPS_PORT", 1465), tls: :implicit, role: :submission, hostname: hostname }
         ]
         ports = specs.map { |s| s[:port] }
         unless ports.uniq.size == ports.size

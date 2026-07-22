@@ -44,7 +44,7 @@ but the extension is not negotiated), `ETRN`, `EXPN`.
 | AUTH attempts per session | 3 | `421` + disconnect (per-IP lockout spans connections, see README) |
 | Connections | 100 global / 10 per IP | `421` at accept |
 | Connection rate | 60 per IP per 60 s | escalating pre-banner tarpit, 1 s doubling to 16 s (loopback exempt) |
-| DNSBL-listed peer (`MAIL_ON_RAILS_RBLS`) | off by default | `554 5.7.1` at `MAIL FROM` (unauthenticated MX only; fails open on DNS trouble) |
+| DNSBL-listed peer (`SMTP_RBLS`) | off by default | `554 5.7.1` at `MAIL FROM` (unauthenticated MX only; fails open on DNS trouble) |
 | Session idle timeout | 300 s | disconnect |
 | Implicit-TLS handshake timeout | 30 s | disconnect |
 | Received-hop loop guard | > 4 own hops | `550 Loop detected` |

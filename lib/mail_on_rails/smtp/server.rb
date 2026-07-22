@@ -35,7 +35,7 @@ module MailOnRails
     #     and the daemon exits for the container runtime to restart.
     #   - Thread mode: worker threads popping one shared queue. Used when
     #     the store is an injected in-process instance (tests, embedded
-    #     development) or when MAIL_ON_RAILS_SMTP_WORKER_MODE=thread.
+    #     development) or when SMTP_WORKER_MODE=thread.
     #
     # The ConnLimiter, AuthThrottle and RateLimiter always live on the
     # accept side, so the connection caps (process-wide and per-IP), the
@@ -85,7 +85,7 @@ module MailOnRails
                                      window: self.class::AUTH_LOCKOUT_SECONDS)
         @rate = RateLimiter.new(limit: self.class::CONN_RATE_LIMIT,
                                 window: self.class::CONN_RATE_WINDOW)
-        @worker_count = [ workers || Config.int("MAIL_ON_RAILS_SMTP_WORKERS", Etc.nprocessors, min: 1), 1 ].max
+        @worker_count = [ workers || Config.int("SMTP_WORKERS", Etc.nprocessors, min: 1), 1 ].max
         @dispatchers = []
         @round_robin = 0
         @mutex = Mutex.new
@@ -118,9 +118,9 @@ module MailOnRails
       # Ractor mode needs per-Ractor store construction; a store advertises
       # that with #worker_config. Injected instances (Store::Memory, custom
       # embedded stores) fall back to threads, as does an explicit
-      # MAIL_ON_RAILS_SMTP_WORKER_MODE=thread override.
+      # SMTP_WORKER_MODE=thread override.
       def worker_mode
-        return :thread if ENV["MAIL_ON_RAILS_SMTP_WORKER_MODE"] == "thread"
+        return :thread if ENV["SMTP_WORKER_MODE"] == "thread"
 
         @store.respond_to?(:worker_config) ? :ractor : :thread
       end

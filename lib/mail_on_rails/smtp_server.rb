@@ -31,23 +31,23 @@ module MailOnRails
     MAX_RECIPIENTS = 100
     MAX_MESSAGES_PER_SESSION = 100
     MAX_AUTH_ATTEMPTS = 3
-    MAX_CONNECTIONS = Smtp::Config.int("MAIL_ON_RAILS_SMTP_MAX_CONN", 100, min: 1)
+    MAX_CONNECTIONS = Smtp::Config.int("SMTP_MAX_CONN", 100, min: 1)
     # Per-IP anti-abuse, enforced on the accept side (ConnLimiter /
     # AuthThrottle): concurrent-connection cap per peer IP, and a lockout
     # after repeated failed AUTHs (which otherwise cost the host app an HTTP
     # credential check each, MAX_AUTH_ATTEMPTS per connection, fresh on
     # every reconnect). 0 disables either.
-    MAX_CONNECTIONS_PER_IP = Smtp::Config.int("MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP", 10)
-    AUTH_LOCKOUT_FAILURES = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES", 10)
-    AUTH_LOCKOUT_SECONDS = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS", 900, min: 1)
+    MAX_CONNECTIONS_PER_IP = Smtp::Config.int("SMTP_MAX_CONN_PER_IP", 10)
+    AUTH_LOCKOUT_FAILURES = Smtp::Config.int("SMTP_AUTH_LOCKOUT_FAILURES", 10)
+    AUTH_LOCKOUT_SECONDS = Smtp::Config.int("SMTP_AUTH_LOCKOUT_SECONDS", 900, min: 1)
     # Sliding-window connection rate per peer IP; connections over the
     # budget are tarpitted with an escalating pre-banner delay (see
     # Smtp::RateLimiter). 0 disables.
-    CONN_RATE_LIMIT = Smtp::Config.int("MAIL_ON_RAILS_SMTP_CONN_RATE", 60)
-    CONN_RATE_WINDOW = Smtp::Config.int("MAIL_ON_RAILS_SMTP_CONN_RATE_WINDOW", 60, min: 1)
+    CONN_RATE_LIMIT = Smtp::Config.int("SMTP_CONN_RATE", 60)
+    CONN_RATE_WINDOW = Smtp::Config.int("SMTP_CONN_RATE_WINDOW", 60, min: 1)
     # Protocol tracing default; per-listener spec[:trace] overrides. Read at
     # load time because worker Ractors cannot access ENV.
-    TRACE_DEFAULT = ENV["MAIL_ON_RAILS_SMTP_TRACE"] == "1"
+    TRACE_DEFAULT = ENV["SMTP_TRACE"] == "1"
     LOG_REDACTION = "[redacted]"
 
     private
@@ -471,7 +471,7 @@ module MailOnRails
 
       # SPF/DKIM/DMARC switch: per-listener spec[:sender_auth] wins (the
       # test seam - worker Ractors cannot read ENV at runtime), else the
-      # load-time MAIL_ON_RAILS_SENDER_AUTH default.
+      # load-time SMTP_SENDER_AUTH default.
       def sender_auth?
         @spec.fetch(:sender_auth) { Smtp::SenderAuth.enabled? }
       end

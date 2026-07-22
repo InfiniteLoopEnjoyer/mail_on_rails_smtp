@@ -5,8 +5,8 @@
 # runs the SMTP listeners (MX + submission) in the foreground, no Rails and
 # no database anywhere in the process. Credential checks, recipient
 # validation, and outbound queueing go to the host app's private HTTP API
-# (MAIL_ON_RAILS_INTERNAL_API_URL); accepted inbound mail goes to its
-# Action Mailbox relay ingress (MAIL_ON_RAILS_INGRESS_URL).
+# (SMTP_INTERNAL_API_URL); accepted inbound mail goes to its
+# Action Mailbox relay ingress (SMTP_INGRESS_URL).
 
 require "bundler/setup"
 $LOAD_PATH.unshift File.expand_path("../lib", __dir__)

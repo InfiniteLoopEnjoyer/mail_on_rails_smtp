@@ -37,7 +37,7 @@ class HealthcheckTest < Minitest::Test
   end
 
   def healthcheck(port)
-    system({ "MAIL_ON_RAILS_SMTP_PORT" => port.to_s }, RbConfig.ruby, SCRIPT,
+    system({ "SMTP_PORT" => port.to_s }, RbConfig.ruby, SCRIPT,
            out: IO::NULL, err: IO::NULL)
     $CHILD_STATUS
   end

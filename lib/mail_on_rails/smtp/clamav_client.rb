@@ -26,8 +26,8 @@ module MailOnRails
       # Read at load time because sessions run inside worker Ractors, which
       # cannot access ENV; per-listener spec[:clamav_addr]/[:clamav_timeout]
       # override these (the test seam). Unset/empty addr disables scanning.
-      ADDR = ENV["MAIL_ON_RAILS_CLAMAV_ADDR"].to_s.strip.freeze
-      TIMEOUT = Smtp::Config.int("MAIL_ON_RAILS_CLAMAV_TIMEOUT", 10, min: 1)
+      ADDR = ENV["SMTP_CLAMAV_ADDR"].to_s.strip.freeze
+      TIMEOUT = Smtp::Config.int("SMTP_CLAMAV_TIMEOUT", 10, min: 1)
 
       def self.enabled? = !ADDR.empty?
 

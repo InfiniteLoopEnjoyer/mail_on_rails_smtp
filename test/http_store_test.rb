@@ -240,7 +240,7 @@ class HttpStoreTest < Minitest::Test
       result = store_backed_by(api).authenticate("a@b.test", "pw")
 
       assert_equal :internal, result[:code]
-      assert_includes result[:error], "MAIL_ON_RAILS_INTERNAL_API_PASSWORD"
+      assert_includes result[:error], "SMTP_INTERNAL_API_PASSWORD"
     end
   end
 

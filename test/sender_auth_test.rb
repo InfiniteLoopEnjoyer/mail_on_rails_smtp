@@ -55,7 +55,7 @@ class SenderAuthTest < Minitest::Test
     assert_nil MailOnRails::Smtp::SenderAuth.from_domain("Subject: no from\r\n\r\nhi\r\n")
   end
 
-  test "enforcement is off unless MAIL_ON_RAILS_DMARC_ENFORCE=1" do
+  test "enforcement is off unless SMTP_DMARC_ENFORCE=1" do
     assert_not MailOnRails::Smtp::SenderAuth.enforce_dmarc?
   end
 end
