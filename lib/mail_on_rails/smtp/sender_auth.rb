@@ -50,6 +50,15 @@ module MailOnRails
         end
       end
 
+      # Master switch for the verifiers, read at load time because sessions
+      # run inside worker Ractors, which cannot read ENV at runtime;
+      # per-listener spec[:sender_auth] overrides it (the test seam). On by
+      # default - only "0" disables - for local try-outs where live DNS
+      # lookups per message are unwanted.
+      ENABLED = ENV["MAIL_ON_RAILS_SENDER_AUTH"] != "0"
+
+      def self.enabled? = ENABLED
+
       # Reject at SMTP time on DMARC p=reject failures? Off by default:
       # verdicts are recorded either way, and flipping this on should wait
       # until the verifiers have proven themselves against real traffic.

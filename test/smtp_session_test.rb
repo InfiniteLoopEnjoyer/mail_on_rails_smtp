@@ -54,12 +54,30 @@ class SmtpSessionTest < Minitest::Test
   # SPF/DKIM/DMARC would do live DNS; return "no verdict" instead
   # (verification has its own suites in this gem).
   def without_sender_verification
+    recording_sender_verification { yield }
+  end
+
+  # Replaces SenderAuth.verify with a recorder that returns "no verdict",
+  # so tests can assert whether verification ran without live DNS.
+  def recording_sender_verification
+    calls = []
     singleton = MailOnRails::Smtp::SenderAuth.singleton_class
     original = MailOnRails::Smtp::SenderAuth.method(:verify)
-    singleton.define_method(:verify) { |**| nil }
-    yield
+    singleton.define_method(:verify) { |**kwargs| calls << kwargs; nil }
+    yield calls
   ensure
     singleton.define_method(:verify, original)
+  end
+
+  # Full EHLO -> DATA exchange for one message; returns the final reply.
+  def deliver_message(client)
+    read_reply(client)
+    command(client, "EHLO client.test")
+    command(client, "MAIL FROM:<sender@remote.test>")
+    command(client, "RCPT TO:<#{EMAIL}>")
+    command(client, "DATA")
+    client.write(RAW)
+    command(client, ".")
   end
 
   def test_mx_session_refuses_mail_from_a_dnsbl_listed_ip
@@ -80,6 +98,29 @@ class SmtpSessionTest < Minitest::Test
       command(client, "EHLO client.test")
       assert_match(/\A250/, command(client, "MAIL FROM:<sender@remote.test>"))
     end
+  end
+
+  def test_mx_session_verifies_sender_when_sender_auth_is_enabled
+    recording_sender_verification do |calls|
+      with_session(spec_extra: { sender_auth: true }) do |client|
+        assert_match(/\A250 OK: queued/, deliver_message(client))
+      end
+
+      assert_equal 1, calls.size, "SenderAuth.verify must run for unauthenticated MX mail"
+    end
+  end
+
+  def test_mx_session_skips_sender_verification_when_disabled
+    recording_sender_verification do |calls|
+      with_session(spec_extra: { sender_auth: false }) do |client|
+        assert_match(/\A250 OK: queued/, deliver_message(client))
+      end
+
+      assert_empty calls, "SenderAuth.verify must not run when sender auth is off"
+    end
+
+    message = @store.inbound_messages.last
+    assert_nil message[:auth_results], "a skipped verification must not stamp a verdict"
   end
 
   def test_mx_session_accepts_local_mail_end_to_end

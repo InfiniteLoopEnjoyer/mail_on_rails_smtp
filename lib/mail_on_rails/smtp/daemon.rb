@@ -76,6 +76,14 @@ module MailOnRails
           logger.warn "[mail_on_rails] MAIL_ON_RAILS_DMARC_ENFORCE=#{enforce} does NOT enable " \
                       "enforcement - only \"1\" does"
         end
+        sender_auth = ENV["MAIL_ON_RAILS_SENDER_AUTH"]
+        if sender_auth == "0"
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SENDER_AUTH=0 - inbound mail is accepted " \
+                      "without SPF/DKIM/DMARC verification"
+        elsif sender_auth && sender_auth.match?(/\A(false|no|off|disabled)\z/i)
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SENDER_AUTH=#{sender_auth} does NOT disable " \
+                      "verification - only \"0\" does"
+        end
       end
 
       # Starts the server on a named thread and returns it. A server that

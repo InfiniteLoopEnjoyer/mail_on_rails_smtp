@@ -411,7 +411,7 @@ module MailOnRails
         end
 
         auth_results = nil
-        if @spec[:role] == :mx && !@authenticated_as
+        if @spec[:role] == :mx && !@authenticated_as && sender_auth?
           verdict = verify_sender(body)
           auth_results = verdict&.summary
           if verdict&.dmarc_reject?
@@ -467,6 +467,13 @@ module MailOnRails
           reply 250, "OK: queued as #{result[:id]}"
         end
         reset
+      end
+
+      # SPF/DKIM/DMARC switch: per-listener spec[:sender_auth] wins (the
+      # test seam - worker Ractors cannot read ENV at runtime), else the
+      # load-time MAIL_ON_RAILS_SENDER_AUTH default.
+      def sender_auth?
+        @spec.fetch(:sender_auth) { Smtp::SenderAuth.enabled? }
       end
 
       # SPF/DKIM/DMARC for unauthenticated MX mail. DNS-heavy but bounded

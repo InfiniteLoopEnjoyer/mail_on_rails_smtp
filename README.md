@@ -188,6 +188,7 @@ surfaces:
 | `MAIL_ON_RAILS_HELO_HOST` | hostname | Banner/EHLO name |
 | `MAIL_ON_RAILS_TLS_CERT` / `_TLS_KEY` | - | PEM paths; if set but missing/unloadable the daemon refuses to boot (else self-signed under `MAIL_ON_RAILS_TLS_DIR`, default `storage/tls`) |
 | `MAIL_ON_RAILS_TLS_HOSTS` | `localhost` | Comma-separated SANs for the self-signed cert (hostname is always added) |
+| `MAIL_ON_RAILS_SENDER_AUTH` | on | `0` skips SPF/DKIM/DMARC verification entirely (local try-outs; mail is stored without a verdict) |
 | `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
 | `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
 | `MAIL_ON_RAILS_DNS_CACHE_TTL` | `60` | Cap in seconds on the per-worker DNS answer cache (record TTLs bind below it; `0` disables) |
@@ -202,6 +203,63 @@ surfaces:
 | `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
 | `MAIL_ON_RAILS_SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
 | `MAIL_ON_RAILS_SMTP_TRACE` | off | `1` debug-logs the protocol exchange (credentials redacted, DATA payloads omitted) |
+
+### Feature switches
+
+Every optional subsystem can be turned on or off through the variables
+above — nothing needs a code change to try the server out. Two conventions
+to know before flipping anything:
+
+- **Flags are read at load time.** Sessions run inside worker Ractors,
+  which cannot read `ENV` at runtime, so every switch is parsed when the
+  process boots. Changing a variable requires a restart.
+- **Values are strict.** Boolean-ish switches accept exactly `1` (enable)
+  or `0` (disable); `true`/`false`/`yes`/`off` are ignored, and
+  `bin/server --check-config` warns when it spots one of those footguns.
+
+| Feature | Variable | Default | Off when | On when |
+| --- | --- | --- | --- | --- |
+| SPF/DKIM/DMARC verification | `MAIL_ON_RAILS_SENDER_AUTH` | **on** | `0` | anything else / unset |
+| DMARC enforcement (reject on `p=reject` fail) | `MAIL_ON_RAILS_DMARC_ENFORCE` | **off** (record-only) | unset / anything else | `1` |
+| DNSBL (RBL) checks | `MAIL_ON_RAILS_RBLS` | **off** | unset / empty | one or more zones, e.g. `zen.spamhaus.org` |
+| ClamAV virus scanning | `MAIL_ON_RAILS_CLAMAV_ADDR` | **off** | unset / empty | `host[:port]` of a clamd daemon |
+| Per-IP concurrent connection cap | `MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP` | **on** (10) | `0` | any positive cap |
+| Per-IP connection rate tarpit | `MAIL_ON_RAILS_SMTP_CONN_RATE` | **on** (60/window) | `0` | any positive budget |
+| Per-IP auth-failure lockout | `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES` | **on** (10) | `0` | any positive threshold |
+| Protocol tracing | `MAIL_ON_RAILS_SMTP_TRACE` | **off** | unset / anything else | `1` |
+| Ractor workers | `MAIL_ON_RAILS_SMTP_WORKER_MODE` | **auto** | `thread` (plain threads) | `auto` / unset |
+
+The global connection cap (`MAIL_ON_RAILS_SMTP_MAX_CONN`) cannot be
+disabled, only raised. Setting `MAIL_ON_RAILS_SENDER_AUTH=0` stores
+inbound mail with no verdict (`auth_results` empty) and makes DMARC
+enforcement moot; `--check-config` warns when it is off. Pointing
+`MAIL_ON_RAILS_CLAMAV_ADDR` at an unreachable clamd tempfails (`451`)
+rather than letting mail skip scanning — only set it for a daemon you
+intend to keep running.
+
+### How tests validate on and off
+
+Because flags are load-time constants, tests don't flip `ENV` around a
+running server. Each feature instead has a per-listener spec seam that
+overrides the env-derived default, and suites cover both states through it:
+
+| Feature | Seam | On/off coverage |
+| --- | --- | --- |
+| Sender verification | `spec[:sender_auth]` | `test/smtp_session_test.rb` (verify runs when on, skipped and unstamped when off) |
+| DMARC enforcement | env (runtime read) | `test/sender_auth_test.rb` (off unless `1`; reject verdicts), `test/dmarc_test.rb` |
+| DNSBL | `spec[:dnsbl]` | `test/smtp_session_test.rb` (listed refused / unlisted accepted), `test/dnsbl_test.rb` |
+| Virus scanning | `spec[:clamav_addr]` / `spec[:clamav_timeout]` | `test/smtp_virus_scan_test.rb` (clean, infected, unavailable, disabled) |
+| Anti-abuse caps | constructor arguments | `test/conn_limiter_test.rb`, `test/rate_limiter_test.rb`, `test/auth_throttle_test.rb` (incl. `0` = disabled) |
+| Tracing | `spec[:trace]` | `test/smtp_session_test.rb` |
+
+Boot-time validation and the footgun warnings (`SENDER_AUTH=false`,
+`DMARC_ENFORCE=true`, unknown worker modes) are covered by
+`test/config_validation_test.rb` against `bin/server --check-config`.
+
+When adding a new toggle, follow the same pattern: read the variable once
+at load time, expose a per-listener `spec[:...]` override as the test
+seam, warn in `Daemon.config_warnings` when a value looks like a mistake,
+and add both an "on" and an "off" test.
 
 ## Sender verification (SPF / DKIM / DMARC)
 

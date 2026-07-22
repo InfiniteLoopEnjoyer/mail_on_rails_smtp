@@ -134,6 +134,30 @@ class ConfigValidationTest < Minitest::Test
     end
   end
 
+  test "check_config warns when sender auth is disabled" do
+    Dir.mktmpdir do |dir|
+      ENV["MAIL_ON_RAILS_TLS_DIR"] = dir
+      ENV["MAIL_ON_RAILS_SENDER_AUTH"] = "0"
+
+      ok, log = check_config
+
+      assert ok, "disabling sender auth is a warning, not a failure"
+      assert_match(/without SPF\/DKIM\/DMARC verification/, log)
+    end
+  end
+
+  test "check_config warns about the SENDER_AUTH=false footgun" do
+    Dir.mktmpdir do |dir|
+      ENV["MAIL_ON_RAILS_TLS_DIR"] = dir
+      ENV["MAIL_ON_RAILS_SENDER_AUTH"] = "false"
+
+      ok, log = check_config
+
+      assert ok
+      assert_match(/does NOT disable/, log)
+    end
+  end
+
   test "check_config warns about missing passwords and unknown worker mode" do
     Dir.mktmpdir do |dir|
       ENV["MAIL_ON_RAILS_TLS_DIR"] = dir
