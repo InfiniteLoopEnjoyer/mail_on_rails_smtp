@@ -48,6 +48,32 @@ class WorkerPoolTest < Minitest::Test
     AUTH_LOCKOUT_SECONDS = 60
   end
 
+  # Ractor-rebuildable store whose recipient check raises a bare Exception:
+  # it rips through Session#run's StandardError rescue and Worker#handle's
+  # IO rescues, killing the session fiber, the scheduler thread, and with
+  # them the whole worker Ractor - the trigger for the death-policy tests.
+  class WorkerKillingStore
+    def self.from_config(_config = {}) = new
+    def worker_config = { store_class: self.class }
+    def log(_level, _message) = nil
+    def authenticate(_email, _password) = { account_id: nil, email: nil }
+    # rubocop:disable Lint/RaiseException -- escaping every rescue is the point
+    def local_rcpts(_addresses) = raise(Exception, "intentional worker kill (death-policy test)")
+    # rubocop:enable Lint/RaiseException
+    def smtp_store(*, **) = { error: "unavailable", code: :internal }
+  end
+
+  # Two per-IP slots + a single worker: when the worker dies, a parked
+  # session must have its slot swept or the per-IP cap stays half-used.
+  class RespawnServer < MailOnRails::SmtpServer
+    MAX_CONNECTIONS_PER_IP = 2
+  end
+
+  # Zero respawn budget: the first worker death is treated as systemic.
+  class NoRespawnServer < MailOnRails::SmtpServer
+    MAX_WORKER_RESPAWNS = 0
+  end
+
   def setup
     @cleanup = []
   end
@@ -65,8 +91,8 @@ class WorkerPoolTest < Minitest::Test
       { host: "127.0.0.1", port: listener.addr[1], tls: tls, role: role,
         hostname: "mx.test", tcp_server: listener }.merge(spec_extra)
     end
-    thread = Thread.new { server_class.run(store, specs, tls_material, workers: workers) }
-    @cleanup << -> { thread.kill }
+    @server_thread = Thread.new { server_class.run(store, specs, tls_material, workers: workers) }
+    @cleanup << -> { @server_thread.kill }
     specs
   end
 
@@ -326,6 +352,47 @@ class WorkerPoolTest < Minitest::Test
     assert wait_for_lockout(spec), "auth failures did not reach the accept-side throttle"
   end
 
+  # Drives a session to the point where WorkerKillingStore's Exception
+  # kills the whole worker Ractor. No reply will come; don't read for one.
+  def kill_worker_via(spec)
+    killer = connect(spec)
+
+    assert_match(/\A220 /, read_reply(killer))
+    command(killer, "EHLO killer.test")
+    command(killer, "MAIL FROM:<a@b.test>")
+    killer.write("RCPT TO:<x@y.test>\r\n") # store raises -> worker dies
+    killer.close
+  end
+
+  def test_ractor_worker_death_respawns_and_sweeps_slots
+    spec = start_server(WorkerKillingStore.new, roles: [ [ :mx, :starttls ] ],
+                        server_class: RespawnServer, workers: 1).first
+
+    # A session parked mid-connection when the worker dies never runs
+    # on_done - only the accept side's sweep can free its per-IP slot.
+    holder = connect(spec)
+
+    assert_match(/\A220 /, read_reply(holder))
+
+    kill_worker_via(spec)
+
+    # Both per-IP slots free again (holder's swept, killer's released once,
+    # not twice) AND a replacement worker serving: only then can two fresh
+    # connections hold simultaneous slots and both get banners.
+    assert wait_for_two_concurrent_slots(spec),
+           "replacement worker did not serve with the dead worker's slots swept"
+  end
+
+  def test_ractor_worker_death_beyond_budget_shuts_the_server_down
+    spec = start_server(WorkerKillingStore.new, roles: [ [ :mx, :starttls ] ],
+                        server_class: NoRespawnServer, workers: 1).first
+
+    kill_worker_via(spec)
+
+    refute_nil @server_thread.join(10),
+               "with the respawn budget exhausted, Server#run must return (daemon exits, container restarts)"
+  end
+
   def test_ractor_mode_release_pipe_frees_slots
     spec = start_server(RactorSafeStore.new, roles: [ [ :mx, :starttls ] ], server_class: TinyServer).first
 
@@ -352,6 +419,28 @@ class WorkerPoolTest < Minitest::Test
     tls.connect
     @cleanup << -> { tls.close rescue nil }
     tls
+  end
+
+  # Polls until two simultaneous connections from this IP both get banners.
+  def wait_for_two_concurrent_slots(spec)
+    40.times do
+      begin
+        first = connect(spec)
+        if read_reply(first).to_s.start_with?("220")
+          second = connect(spec)
+          ok = read_reply(second).to_s.start_with?("220")
+          second.close
+          first.close
+          return true if ok
+        else
+          first.close
+        end
+      rescue SystemCallError, IO::TimeoutError
+        nil # dispatched into the dying worker's window; try again
+      end
+      sleep 0.1
+    end
+    false
   end
 
   # Polls until a fresh connection is refused with 421 (lockout engaged).

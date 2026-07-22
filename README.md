@@ -28,8 +28,13 @@ threads stay in the main Ractor with the exact process-wide `ConnLimiter`;
 accepted sockets cross to workers as **raw fd numbers over a control
 pipe** (fds are process-global, and integer messages sidestep Ractor IO
 moves, which Ruby 4.0.6 does not handle reliably under a scheduler -
-probes documented in `scheduler.rb`/`worker.rb`). Finished sessions are
-reported back as single bytes on a shared release pipe.
+probes documented in `scheduler.rb`/`worker.rb`). Finished sessions and
+failed AUTHs are reported back as lines on shared release/auth pipes,
+keyed by the accept-time peer IP so the per-IP caps stay exact. A monitor
+thread per worker enforces a death policy: a worker Ractor that dies is
+logged and replaced (in-flight sessions' connection slots are swept);
+after 5 deaths the failure is treated as systemic and the daemon exits
+for the container runtime to restart.
 
 Ractor mode engages when the store can be rebuilt inside each worker
 (`Store::Http` can - it is env-configured HTTP clients). An injected

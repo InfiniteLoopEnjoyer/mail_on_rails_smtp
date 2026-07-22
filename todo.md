@@ -58,7 +58,27 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### N2) Dead worker Ractor silently drops 1/N of all future connections — **P0/P1** *(found while assessing #6)*
+### N2) Dead worker Ractor silently drops 1/N of all future connections — **P0/P1 — DONE 2026-07-22** *(found while assessing #6)*
+
+> **Resolved with respawn-then-fail-fast:** a monitor thread per worker
+> Ractor (`Server#monitor_worker` via `Ractor#value`) logs a death at error
+> level and spawns a replacement; after `MAX_WORKER_RESPAWNS` (5) deaths per
+> process the failure is treated as systemic — the accept loops stop,
+> `Server#run` returns, and `Daemon.run!` exits non-zero for the container
+> restart. Slot accounting survives death: release-pipe lines now carry the
+> worker index, a per-worker inflight table (dispatch runs fully under the
+> mutex) is swept on replacement to free lost sessions' global/per-IP slots,
+> and the table is the source of truth so late release lines can't
+> double-free. **Bonus finding:** deaths were even sneakier than assumed —
+> all serving ran inside `Scheduler#close` during *thread-exit cleanup*, so
+> a fatal session error was reported-and-swallowed and the Ractor
+> "terminated normally" (`:worker_exit`). `Worker#serve` now runs the event
+> loop explicitly and `Scheduler#close` is one-shot (guarded even on raise)
+> so a half-dead worker can't zombie-serve during cleanup. Validated by two
+> tests in `worker_pool_test.rb` (an Exception-raising store kills a live
+> worker): respawn + slot sweep proven by two concurrent per-IP slots after
+> the death; budget exhaustion proven by `Server#run` returning. Both
+> failed against the swallowing behavior before the fix.
 **What the code does today**
 - `Server#dispatch` round-robins fd numbers over per-Ractor control pipes. If a
   worker Ractor dies (bug, Ractor-mode Ruby regression), writes to its pipe raise

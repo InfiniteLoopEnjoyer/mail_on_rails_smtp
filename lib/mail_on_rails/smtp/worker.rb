@@ -21,8 +21,9 @@ module MailOnRails
     #   IOs misbehave under a fiber scheduler on Ruby 4.0.6; see
     #   scheduler.rb). The worker builds its own store and TLS context
     #   inside the Ractor - neither can be shared across the boundary - and
-    #   reports each finished session as an "<ip>\n" line on the shared
-    #   release pipe (the accept side turns those into ConnLimiter releases)
+    #   reports each finished session as a "<worker index> <ip>\n" line on
+    #   the shared release pipe (the accept side turns those into
+    #   ConnLimiter releases, attributed to this worker's inflight table)
     #   and each failed authentication as an "<ip>\n" line on the shared
     #   auth pipe (feeding the accept side's AuthThrottle). The peer IP is
     #   captured accept-side and threaded through, so both sides of the
@@ -71,9 +72,9 @@ module MailOnRails
       # All arguments must be shareable: session_class is a Class,
       # specs/tls_material/store_config are deep-frozen data,
       # release_fd/ready_port are an Integer and a Port.
-      def self.spawn_ractor(session_class:, specs:, tls_material:, store_config:, release_fd:, auth_fd:, ready_port:)
+      def self.spawn_ractor(session_class:, specs:, tls_material:, store_config:, index:, release_fd:, auth_fd:, ready_port:)
         ractor = Ractor.new(session_class, specs, tls_material, store_config,
-                            release_fd, auth_fd, ready_port) do |session_class, specs, tls_material, store_config, release_fd, auth_fd, ready_port|
+                            index, release_fd, auth_fd, ready_port) do |session_class, specs, tls_material, store_config, index, release_fd, auth_fd, ready_port|
           control_r, control_w = IO.pipe
           ready_port.send(control_w.fileno)
 
@@ -89,7 +90,7 @@ module MailOnRails
           # Explicit constant: self inside a Ractor block is the Ractor.
           # Single short pipe writes stay atomic, so workers can share fds.
           Worker.new(store: store, session_class: session_class, tls: tls,
-                     on_done: ->(ip) { release.write("#{ip}\n") },
+                     on_done: ->(ip) { release.write("#{index} #{ip}\n") },
                      on_auth_failure: ->(ip) { auth.write("#{ip}\n") if ip }).serve_pipe(control_r, specs)
           :worker_exit
         end
@@ -100,10 +101,15 @@ module MailOnRails
 
       # The serving core: dispatcher fiber pulls connections from the
       # supplier (which parks the fiber, not the thread, when idle) until it
-      # returns nil. Falling off the end lets Ruby run Scheduler#close,
-      # which keeps the event loop alive until every session finishes.
+      # returns nil. The scheduler's event loop (Scheduler#close) runs
+      # explicitly HERE, not in thread-exit cleanup: an error that escapes
+      # the rescues in handle must propagate as the worker's real outcome -
+      # Server's death policy depends on seeing it - whereas an exception
+      # out of thread-exit cleanup is reported and swallowed, leaving the
+      # Ractor to terminate with the block's value as if nothing happened.
       def serve(&supplier)
-        Fiber.set_scheduler(Scheduler.new)
+        scheduler = Scheduler.new
+        Fiber.set_scheduler(scheduler)
         Fiber.schedule do
           loop do
             socket, spec, ip = supplier.call
@@ -112,6 +118,7 @@ module MailOnRails
             Fiber.schedule { handle(socket, spec, ip) }
           end
         end
+        scheduler.close # serves until every session finishes; re-raises fatal errors
       end
 
       def handle(socket, spec, ip = nil)

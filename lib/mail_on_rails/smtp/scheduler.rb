@@ -22,9 +22,10 @@ module MailOnRails
     # the same error the non-scheduler IO path raises.
     #
     # Usage (see Worker): set as the scheduler on a fresh thread, start the
-    # root fiber with Fiber.schedule, and let the thread fall off the end -
-    # Ruby then calls #close, which runs the event loop until no fiber is
-    # waiting on anything.
+    # root fiber with Fiber.schedule, then call #close explicitly - it runs
+    # the event loop until no fiber is waiting on anything, and re-raises a
+    # fatal session error as the caller's own (so it becomes the worker's
+    # visible outcome rather than swallowed thread-exit cleanup).
     class Scheduler
       # One armed timer. action :wake resumes the fiber with :timeout (the
       # io_wait/block "timed out" signal); an exception class action is
@@ -168,10 +169,23 @@ module MailOnRails
         fiber.raise(exception) if fiber.alive?
       end
 
+      # One-shot: Worker#serve calls this to run the event loop until no
+      # fiber is waiting on anything. Ruby calls it AGAIN at thread exit
+      # (the scheduler is still set), and after a fatal error escaped the
+      # first run that second call must not resume the surviving fibers -
+      # the worker would become a zombie serving sessions while its Server
+      # monitor thinks it is dead. The @closed guard (set even when run
+      # raises) makes the second call a no-op.
       def close
-        run
-        @wake_r.close
-        @wake_w.close
+        return if @closed
+
+        begin
+          run
+        ensure
+          @closed = true
+          @wake_r.close
+          @wake_w.close
+        end
       end
 
       private
