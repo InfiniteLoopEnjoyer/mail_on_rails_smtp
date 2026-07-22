@@ -2,6 +2,7 @@
 
 require "socket"
 require "etc"
+require_relative "config"
 require_relative "conn_limiter"
 require_relative "auth_throttle"
 require_relative "tls"
@@ -76,7 +77,7 @@ module MailOnRails
         @limiter = ConnLimiter.new(self.class::MAX_CONNECTIONS, per_ip: self.class::MAX_CONNECTIONS_PER_IP)
         @throttle = AuthThrottle.new(limit: self.class::AUTH_LOCKOUT_FAILURES,
                                      window: self.class::AUTH_LOCKOUT_SECONDS)
-        @worker_count = [ workers || Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_WORKERS") { Etc.nprocessors }), 1 ].max
+        @worker_count = [ workers || Config.int("MAIL_ON_RAILS_SMTP_WORKERS", Etc.nprocessors, min: 1), 1 ].max
         @dispatchers = []
         @round_robin = 0
         @mutex = Mutex.new

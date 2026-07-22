@@ -136,8 +136,9 @@ verifiers record `temperror` verdicts, so a DNS outage is visible in
 ## Test / run
 
     bundle install
-    bin/test        # Rails-free suite (loopback sessions, sender auth, contracts)
-    bin/server      # foreground daemon
+    bin/test                    # Rails-free suite (loopback sessions, sender auth, contracts)
+    bin/server                  # foreground daemon
+    bin/server --check-config   # deploy preflight: validate env config, exit 0/1
 
 ## Deploy
 

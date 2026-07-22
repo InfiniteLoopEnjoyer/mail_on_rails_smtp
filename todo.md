@@ -129,7 +129,7 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### N4) Mixed-recipient partial failure double-queues outbound mail — **P1** *(overlaps #3, #16)*
+### N4) Mixed-recipient partial failure double-queues outbound mail — **P1 — DONE 2026-07-22 (with #3)** *(overlaps #16)*
 **What the code does today**
 - `Store::Http#smtp_store` with both remote and local recipients: it queues
   outbound first, then POSTs inbound to the ingress. If outbound succeeds and the
@@ -174,7 +174,15 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 2) TLS failure cases — **reframed, P1**
+### 2) TLS failure cases — **P1 — DONE 2026-07-22**
+
+> **Resolved:** `test/tls_failure_test.rb` covers garbage-after-STARTTLS
+> (connection torn down, worker survives), mid-handshake disconnect, and the
+> previously untested `ContextProvider` renewal flow: renewed cert files are
+> picked up live, a broken renewal keeps serving the old context, a
+> completed renewal recovers after a broken one, static PEM material never
+> reloads. Client-cert validity tests were skipped by design (VERIFY_NONE —
+> the client's concern).
 **Analysis**
 - The original plan (expired certs, bad SAN/CN, invalid chain) tests behavior
   this server doesn't have: it runs `VERIFY_NONE` and never validates client
@@ -199,7 +207,17 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 3) HTTP store failure taxonomy — **narrowed, P1**
+### 3) HTTP store failure taxonomy — **P1 — DONE 2026-07-22** *(includes N4)*
+
+> **Resolved:** `InternalApi` gained injectable timeouts and a 401 hint
+> (`(check MAIL_ON_RAILS_INTERNAL_API_PASSWORD)`) so auth rejections read as
+> config, not weather. New tests drive the REAL Net::HTTP client against a
+> scripted TCP responder: hung app (bounded by read timeout), non-JSON 200,
+> 401, refused connection — all degrade to the `:internal` envelope. The
+> no-retry policy and both at-least-once duplicate windows are now
+> documented in the `Store::Http` class comment, and N4 (outbound re-queued
+> on sender retry after an ingress failure) is pinned by a test so any
+> change to the ordering is a conscious one.
 **Analysis**
 - Partially done: `http_store_test.rb` covers connection-refused → `:internal` →
   451, ingress refusal → 451, and 507 → `:insufficient_storage` → 452.
@@ -267,7 +285,18 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 7) Protocol fuzzing — **kept, scaled down, P1**
+### 7) Protocol fuzzing — **P1 — DONE 2026-07-22**
+
+> **Resolved:** `test/smtp_parser_abuse_test.rb` — seeded-PRNG garbage
+> sessions (binary, control bytes, invalid UTF-8, junk args, overlong
+> lines) with global invariants (every reply well-formed, nothing stored,
+> and the parser-crash signature `"SMTP session error"` forbidden in logs),
+> plus deterministic edge cases: NUL in commands, overlong-line fragments
+> setting no envelope state, a 200-command pipelining blast, garbage-base64
+> AUTH and challenge recovery. **Found and fixed one real issue:** EHLO/HELO
+> arguments were echoed raw into replies, so a bare LF inside a command
+> injected raw lines into our response — `reply`/`multi` now flatten
+> unprintable bytes (fix verified to fail without it).
 **Analysis**
 - Real, but right-size it: the dispatcher is small and the scary cases
   (dot-stuffing smuggling, CRLF split at the chunk cap, overlong lines, flood
@@ -285,7 +314,13 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 8) Security hardening edge cases — **split: header tests cheap P1; rate limits → #12**
+### 8) Security hardening edge cases — **P1 — DONE 2026-07-22** *(rate limits shipped with #12)*
+
+> **Resolved:** `test/ingress_stamping_test.rb` pins the trust boundary:
+> folded forged trust headers stripped with their continuations, mixed-case
+> and bare-LF variants stripped, lookalike headers kept, CR/LF injection
+> through envelope values (MAIL FROM / RCPT / auth-results) flattened, and
+> every stamped header line verified control-byte-free.
 **Analysis**
 - Header smuggling defenses exist and are partially tested
   (`IngressClient#strip_trusted_headers` handles folded headers via the
@@ -319,7 +354,18 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ---
 
-### 10) Config validation — **kept, P1 (with N3 as the P0 core)**
+### 10) Config validation — **P1 — DONE 2026-07-22**
+
+> **Resolved:** new `Smtp::Config` module (`Config.int`/`Config.port`) gives
+> every env integer a named, bounded, actionable error; used by all listener
+> caps, ports, DNS timeout, and worker count. `Daemon.listeners` rejects
+> duplicate ports; `Daemon.run!` refuses to start on `Config::Error` (same
+> path as `TLS::Error`); `bin/server --check-config` runs the preflight
+> (summary line + warnings, exit 0/1) and catches even require-time constant
+> failures as one clean line. `Daemon.config_warnings` flags the quiet
+> footguns: unset API/ingress passwords, unknown `WORKER_MODE`, and
+> `DMARC_ENFORCE=true` (only `"1"` enables). 11 tests in
+> `config_validation_test.rb`; all three CLI paths exercised live.
 **Analysis**
 - Correct and cheap. Today: bad port strings raise a bare `ArgumentError` from
   `Integer()`; a missing internal-API password only surfaces as runtime 451s/535s;
@@ -451,7 +497,10 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 7. **2** TLS failure tests incl. ContextProvider renewal reload
 8. **7** parser abuse test file
 9. **8** trust-header edge-case tests
-10. CI setup (prerequisite for the "matrix" ambitions in #6)
+10. ~~CI setup~~ **DONE 2026-07-22** — `.github/workflows/ruby.yml` existed
+    but was broken: it ran `bundle exec rake` (no Rakefile exists) with a
+    2023-pinned `setup-ruby` that predates Ruby 4.0. Now runs `bin/test` +
+    `rubocop --parallel` on `ruby/setup-ruby@v1` (repo is rubocop-clean).
 
 ### Phase 3 — docs and polish (P2)
 11. **4** delivery-guarantees README section

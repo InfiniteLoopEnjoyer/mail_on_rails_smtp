@@ -18,6 +18,20 @@ module MailOnRails
       # contract's error envelope and the SMTP session answers a temporary
       # failure - sending servers retry, which is SMTP's own durability
       # buffer (see Store::Contracts).
+      #
+      # Retry policy: deliberately NONE here. This daemon holds no queue and
+      # never retries a failed HTTP call - the sending MTA's queue is the
+      # retry mechanism, driven by our 4xx replies. Adding daemon-side
+      # retries would only delay that signal and double-submit on ambiguous
+      # failures.
+      #
+      # Delivery semantics are at-least-once with two known duplicate
+      # windows: (a) a crash after the ingress accepted but before our 250
+      # reaches the sender, and (b) mixed local+remote recipients where
+      # outbound queueing succeeds and the ingress then fails - the 451
+      # makes the sender retry the whole message, so the outbound copies are
+      # queued again on every retry until the ingress recovers (pinned in
+      # http_store_test.rb; dedupe belongs app-side where the queue lives).
       class Http
         def initialize(api: nil, ingress: nil, logger: Logger.new($stdout))
           @logger = logger

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "mail_on_rails/smtp/config"
 require "mail_on_rails/smtp/server"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/smtp/sender_auth"
@@ -28,15 +29,15 @@ module MailOnRails
     MAX_RECIPIENTS = 100
     MAX_MESSAGES_PER_SESSION = 100
     MAX_AUTH_ATTEMPTS = 3
-    MAX_CONNECTIONS = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_MAX_CONN", 100))
+    MAX_CONNECTIONS = Smtp::Config.int("MAIL_ON_RAILS_SMTP_MAX_CONN", 100, min: 1)
     # Per-IP anti-abuse, enforced on the accept side (ConnLimiter /
     # AuthThrottle): concurrent-connection cap per peer IP, and a lockout
     # after repeated failed AUTHs (which otherwise cost the host app an HTTP
     # credential check each, MAX_AUTH_ATTEMPTS per connection, fresh on
     # every reconnect). 0 disables either.
-    MAX_CONNECTIONS_PER_IP = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP", 10))
-    AUTH_LOCKOUT_FAILURES = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES", 10))
-    AUTH_LOCKOUT_SECONDS = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS", 900))
+    MAX_CONNECTIONS_PER_IP = Smtp::Config.int("MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP", 10)
+    AUTH_LOCKOUT_FAILURES = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES", 10)
+    AUTH_LOCKOUT_SECONDS = Smtp::Config.int("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS", 900, min: 1)
     # Protocol tracing default; per-listener spec[:trace] overrides. Read at
     # load time because worker Ractors cannot access ENV.
     TRACE_DEFAULT = ENV["MAIL_ON_RAILS_SMTP_TRACE"] == "1"
@@ -460,18 +461,28 @@ module MailOnRails
       end
 
       # -- replies -----------------------------------------------------------
+      #
+      # Reply text can echo client input (EHLO/HELO arguments); embedded
+      # CR/LF or control bytes there would inject raw line breaks into our
+      # replies, so everything unprintable is flattened before the wire.
 
       def reply(code, text)
+        text = sanitize_reply(text)
         trace "=> #{code} #{text}"
         @socket.write("#{code} #{text}\r\n")
       end
 
       def multi(code, lines)
         lines.each_with_index do |text, i|
+          text = sanitize_reply(text)
           separator = i == lines.length - 1 ? " " : "-"
           trace "=> #{code}#{separator}#{text}"
           @socket.write("#{code}#{separator}#{text}\r\n")
         end
+      end
+
+      def sanitize_reply(text)
+        text.to_s.gsub(/[^[:print:]]/, " ")
       end
     end
   end

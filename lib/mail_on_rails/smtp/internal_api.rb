@@ -26,9 +26,14 @@ module MailOnRails
       OPEN_TIMEOUT = 5
       READ_TIMEOUT = 60 # outbound queueing ships whole messages
 
-      def initialize(url: default_url, password: default_password)
+      # Timeouts are injectable so tests can exercise the hung-app path
+      # without waiting out the production 60s.
+      def initialize(url: default_url, password: default_password,
+                     open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT)
         @base = URI(url.to_s.chomp("/"))
         @password = password
+        @open_timeout = open_timeout
+        @read_timeout = read_timeout
       end
 
       # => { account_id:, email: } (both nil on bad credentials)
@@ -54,7 +59,7 @@ module MailOnRails
         return true if response.is_a?(Net::HTTPSuccess)
 
         code = response.is_a?(Net::HTTPInsufficientStorage) ? :insufficient_storage : :internal
-        raise Error.new("outbound queueing failed: #{response.code}", code: code)
+        raise Error.new("outbound queueing failed: #{describe(response)}", code: code)
       end
 
       private
@@ -65,16 +70,23 @@ module MailOnRails
         request.body = JSON.generate(payload)
 
         response = perform(request)
-        raise Error.new("#{endpoint} failed: #{response.code}") unless response.is_a?(Net::HTTPSuccess)
+        raise Error.new("#{endpoint} failed: #{describe(response)}") unless response.is_a?(Net::HTTPSuccess)
 
         JSON.parse(response.body)
+      end
+
+      # A 401 is a configuration error, not weather - say so in the log line
+      # instead of leaving it indistinguishable from an app-side 5xx.
+      def describe(response)
+        hint = response.is_a?(Net::HTTPUnauthorized) ? " (check MAIL_ON_RAILS_INTERNAL_API_PASSWORD)" : ""
+        "#{response.code}#{hint}"
       end
 
       def perform(request)
         # The basic-auth username is fixed by the app's controller.
         request.basic_auth("mail_on_rails", @password.to_s)
         Net::HTTP.start(@base.host, @base.port, use_ssl: @base.scheme == "https",
-                        open_timeout: OPEN_TIMEOUT, read_timeout: READ_TIMEOUT) do |http|
+                        open_timeout: @open_timeout, read_timeout: @read_timeout) do |http|
           http.request(request)
         end
       end

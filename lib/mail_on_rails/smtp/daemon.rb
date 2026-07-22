@@ -2,6 +2,7 @@
 
 require "socket"
 require "logger"
+require_relative "config"
 require_relative "../smtp_server"
 require_relative "tls"
 require_relative "store/http"
@@ -29,11 +30,52 @@ module MailOnRails
         # non-zero so Docker restarts the container.
         logger.error "[mail_on_rails] SMTP server exited - shutting down"
         exit 1
-      rescue TLS::Error => e
-        # Explicitly configured TLS that fails to load must not boot a
-        # plaintext-only mail host that looks healthy.
+      rescue TLS::Error, Config::Error => e
+        # Misconfiguration must not boot a degraded mail host that looks
+        # healthy (explicit TLS falling back to plaintext, a bad port, ...).
         logger.error "[mail_on_rails] #{e.message} - refusing to start"
         exit 1
+      end
+
+      # Deploy preflight (`bin/server --check-config`): validates the same
+      # configuration boot would use and logs a one-line summary. Returns
+      # true when bootable; fatal problems log an error and return false,
+      # suspicious-but-runnable settings log warnings.
+      def check_config(logger: default_logger)
+        host = ENV.fetch("MAIL_ON_RAILS_HOST", "0.0.0.0")
+        specs = listeners(host)
+        tls = TLS.material(dir: ENV.fetch("MAIL_ON_RAILS_TLS_DIR", "storage/tls"), logger: logger)
+        config_warnings(logger)
+        tls_summary = tls ? (tls[:cert_path] ? "from #{tls[:cert_path]}" : "self-signed") : "UNAVAILABLE (plaintext only)"
+        logger.info "[mail_on_rails] config OK: ports #{specs.map { |s| s[:port] }.join("/")} on #{host}, " \
+                    "hostname #{specs.first[:hostname]}, TLS #{tls_summary}"
+        true
+      rescue TLS::Error, Config::Error => e
+        logger.error "[mail_on_rails] config error: #{e.message}"
+        false
+      end
+
+      # Settings that are legal but almost certainly not what the operator
+      # meant - each has caused (or would cause) a quiet runtime failure.
+      def config_warnings(logger)
+        if ENV["MAIL_ON_RAILS_INTERNAL_API_PASSWORD"].to_s.empty?
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_INTERNAL_API_PASSWORD is not set - " \
+                      "the app will refuse credential and recipient checks"
+        end
+        if ENV["MAIL_ON_RAILS_INGRESS_PASSWORD"].to_s.empty? && ENV["RAILS_INBOUND_EMAIL_PASSWORD"].to_s.empty?
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_INGRESS_PASSWORD is not set - " \
+                      "the app will refuse inbound mail"
+        end
+        mode = ENV["MAIL_ON_RAILS_SMTP_WORKER_MODE"]
+        if mode && !%w[thread auto].include?(mode)
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_SMTP_WORKER_MODE=#{mode} is not recognized " \
+                      "(\"thread\" or \"auto\") - treating as auto"
+        end
+        enforce = ENV["MAIL_ON_RAILS_DMARC_ENFORCE"]
+        if enforce && enforce != "1" && enforce.match?(/\A(true|yes|on|enabled)\z/i)
+          logger.warn "[mail_on_rails] MAIL_ON_RAILS_DMARC_ENFORCE=#{enforce} does NOT enable " \
+                      "enforcement - only \"1\" does"
+        end
       end
 
       # Starts the server on a named thread and returns it. A server that
@@ -58,11 +100,17 @@ module MailOnRails
         # Announced in the SMTP banner/EHLO (RFC 5321 wants our FQDN; spam
         # filters compare it to the PTR).
         hostname = ENV.fetch("MAIL_ON_RAILS_HELO_HOST") { Socket.gethostname }
-        [
+        specs = [
           { host: host, port: env_port("MAIL_ON_RAILS_SMTP_PORT", 1025), tls: :starttls, role: :mx, hostname: hostname },
           { host: host, port: env_port("MAIL_ON_RAILS_SMTP_SUBMISSION_PORT", 1587), tls: :starttls, role: :submission, hostname: hostname },
           { host: host, port: env_port("MAIL_ON_RAILS_SMTPS_PORT", 1465), tls: :implicit, role: :submission, hostname: hostname }
         ]
+        ports = specs.map { |s| s[:port] }
+        unless ports.uniq.size == ports.size
+          raise Config::Error, "listener ports must be distinct, got #{ports.join(", ")}"
+        end
+
+        specs
       end
 
       # Hash of plain strings (PEMs or file paths); nil if unavailable.
@@ -73,7 +121,7 @@ module MailOnRails
       end
 
       def env_port(name, default)
-        Integer(ENV.fetch(name, default))
+        Config.port(name, default)
       end
 
       def default_logger

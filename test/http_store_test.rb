@@ -112,4 +112,99 @@ class HttpStoreTest < Minitest::Test
     result = broken.smtp_store("sender@remote.test", [ EMAIL ], MailOnRails::Smtp::Store::Contracts::Smtp::RAW, nil)
     assert_equal :internal, result[:code]
   end
+
+  # -- N4: at-least-once duplication window (documented, pinned) ------------
+  #
+  # Mixed local+remote recipients queue outbound FIRST; if the ingress then
+  # refuses, the session answers 451 and the sending client retries the
+  # whole message - so the outbound copies are queued again. Dedupe belongs
+  # app-side (where the queue lives); this test pins the daemon's behavior
+  # so a change to the ordering or semantics is a conscious one.
+  test "smtp_store queues outbound again when the sender retries after an ingress failure" do
+    account_id
+    refusing = MailOnRails::Smtp::Store::Http.new(api: @api, ingress: RecordingIngress.new(accept: false),
+                                                  logger: Logger.new(IO::NULL))
+    2.times do # the original attempt, then the sender's retry
+      result = refusing.smtp_store(EMAIL, [ EMAIL, "remote@elsewhere.test" ],
+                                   MailOnRails::Smtp::Store::Contracts::Smtp::RAW, EMAIL)
+
+      assert_equal :internal, result[:code], "the ingress refusal must tempfail the whole message"
+    end
+
+    assert_equal 2, @api.outbound.size,
+                 "outbound duplication on retry is the documented at-least-once trade-off"
+  end
+
+  # -- failure taxonomy against a real HTTP client ---------------------------
+  #
+  # A scripted TCP responder exercises MailOnRails::Smtp::InternalApi (the
+  # real Net::HTTP client) rather than a stand-in: read timeouts, non-JSON
+  # bodies, and auth rejections must all degrade to the store contract's
+  # error envelope, never raise into the session.
+
+  # respond: nil hangs forever (never answers); a String is written verbatim.
+  def with_fake_http_server(respond)
+    server = TCPServer.new("127.0.0.1", 0)
+    thread = Thread.new do
+      loop do
+        conn = server.accept
+        while (line = conn.gets) && line != "\r\n"; end # consume request head
+        if respond
+          conn.write(respond)
+          conn.close
+        end # else: hold the connection open, never answering
+      end
+    rescue IOError
+      nil
+    end
+    yield MailOnRails::Smtp::InternalApi.new(url: "http://127.0.0.1:#{server.addr[1]}/internal",
+                                             password: "pw", open_timeout: 1, read_timeout: 0.3)
+  ensure
+    thread&.kill
+    server&.close
+  end
+
+  def store_backed_by(api)
+    MailOnRails::Smtp::Store::Http.new(api: api, ingress: RecordingIngress.new, logger: Logger.new(IO::NULL))
+  end
+
+  test "a hung app surfaces as the internal envelope, bounded by the read timeout" do
+    with_fake_http_server(nil) do |api|
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = store_backed_by(api).local_rcpts([ "a@b.test" ])
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      assert_equal :internal, result[:code]
+      assert_operator elapsed, :<, 5, "the read timeout must bound a hung app"
+    end
+  end
+
+  test "a non-json 200 body surfaces as the internal envelope" do
+    body = "<html>surprise maintenance page</html>"
+    with_fake_http_server("HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}") do |api|
+      result = store_backed_by(api).authenticate("a@b.test", "pw")
+
+      assert_equal :internal, result[:code]
+    end
+  end
+
+  test "a 401 names the password variable so it reads as config, not weather" do
+    with_fake_http_server("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") do |api|
+      result = store_backed_by(api).authenticate("a@b.test", "pw")
+
+      assert_equal :internal, result[:code]
+      assert_includes result[:error], "MAIL_ON_RAILS_INTERNAL_API_PASSWORD"
+    end
+  end
+
+  test "a refused connection surfaces as the internal envelope" do
+    closed = TCPServer.new("127.0.0.1", 0)
+    port = closed.addr[1]
+    closed.close
+    api = MailOnRails::Smtp::InternalApi.new(url: "http://127.0.0.1:#{port}/internal",
+                                             password: "pw", open_timeout: 1, read_timeout: 1)
+    result = store_backed_by(api).local_rcpts([ "a@b.test" ])
+
+    assert_equal :internal, result[:code]
+  end
 end

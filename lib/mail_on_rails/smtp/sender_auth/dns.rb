@@ -3,6 +3,7 @@
 require "resolv"
 require "ipaddr"
 require "socket"
+require_relative "../config"
 
 module MailOnRails
   module Smtp
@@ -31,7 +32,7 @@ module MailOnRails
       class Dns
         class TempError < StandardError; end
 
-        TIMEOUT = Integer(ENV.fetch("MAIL_ON_RAILS_DNS_TIMEOUT", 5))
+        TIMEOUT = Config.int("MAIL_ON_RAILS_DNS_TIMEOUT", 5, min: 1)
         PORT = 53
         MAX_UDP = 4096
 
