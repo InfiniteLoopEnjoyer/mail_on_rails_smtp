@@ -109,6 +109,29 @@ module MailOnRails
             result = store.smtp_store(EMAIL, [ "one@elsewhere.test", "two@elsewhere.test" ], RAW, EMAIL)
             assert_equal :insufficient_storage, result[:code]
           end
+
+          def test_smtp_store_accepts_scan_status
+            account_id
+            result = store.smtp_store("sender@remote.test", [ EMAIL ], RAW, nil, scan_status: "clean")
+            assert result[:id], "expected a stored-message id"
+          end
+
+          def test_quarantine_returns_nil_for_local_recipients
+            account_id
+            assert_nil store.quarantine("sender@remote.test", [ EMAIL ], RAW, nil,
+                                        auth_results: nil, scan_status: "infected", virus: "Eicar-Test-Signature")
+          end
+
+          def test_quarantine_returns_nil_for_authenticated_remote_only_submission
+            account_id
+            assert_nil store.quarantine(EMAIL, [ "friend@elsewhere.test" ], RAW, EMAIL,
+                                        auth_results: nil, scan_status: "unscanned")
+          end
+
+          def test_quarantine_returns_nil_when_no_target_exists
+            assert_nil store.quarantine("sender@remote.test", [ "stranger@example.test" ], RAW, nil,
+                                        auth_results: nil, scan_status: "infected", virus: "X")
+          end
         end
       end
     end

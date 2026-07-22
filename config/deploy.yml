@@ -64,6 +64,13 @@ env:
     MAIL_ON_RAILS_INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
     MAIL_ON_RAILS_INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
 
+    # clamd, the app repo's "clamav" Kamal accessory, reached by container
+    # name over the shared "kamal" docker network (both services deploy to
+    # the same host). Infected DATA answers 550 (plus a quarantined review
+    # copy via the ingress); scanner down answers 451 so senders retry.
+    # Unset to disable scanning at SMTP time.
+    MAIL_ON_RAILS_CLAMAV_ADDR: mail_on_rails-clamav:3310
+
 aliases:
   logs: app logs -f
   shell: app exec --interactive --reuse "bash"

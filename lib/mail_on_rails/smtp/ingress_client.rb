@@ -53,8 +53,10 @@ module MailOnRails
       # X-Original-To so Action Mailbox routing sees BCC'd and aliased
       # recipients; Return-Path records the envelope sender;
       # X-MailOnRails-Authenticated records whether the sender authenticated
-      # (and as whom).
-      def stamp(data, mail_from:, rcpt_to:, authenticated_as:, auth_results: nil)
+      # (and as whom); X-MailOnRails-Scan carries the clamd verdict
+      # ("clean"/"infected"/"unscanned", absent when scanning is disabled)
+      # with X-MailOnRails-Virus naming the signature on infected mail.
+      def stamp(data, mail_from:, rcpt_to:, authenticated_as:, auth_results: nil, scan_status: nil, virus: nil)
         authenticated = authenticated_as.to_s.strip
         stamped = [ "Return-Path: <#{sanitize_header(mail_from)}>\r\n" ]
         stamped += Array(rcpt_to).map { |rcpt| "X-Original-To: #{sanitize_header(rcpt)}\r\n" }
@@ -62,6 +64,8 @@ module MailOnRails
         unless auth_results.to_s.strip.empty?
           stamped << "X-MailOnRails-Auth-Results: #{sanitize_header(auth_results)}\r\n"
         end
+        stamped << "X-MailOnRails-Scan: #{sanitize_header(scan_status)}\r\n" unless scan_status.to_s.strip.empty?
+        stamped << "X-MailOnRails-Virus: #{sanitize_header(virus)}\r\n" unless virus.to_s.strip.empty?
         stamped.join + strip_trusted_headers(data)
       end
 

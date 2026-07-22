@@ -68,7 +68,7 @@ module MailOnRails
           wrap { { local: @api.local_rcpts(addresses) } }
         end
 
-        def smtp_store(mail_from, rcpt_to, data, authenticated_as, auth_results: nil)
+        def smtp_store(mail_from, rcpt_to, data, authenticated_as, auth_results: nil, scan_status: nil)
           wrap do
             addresses = Array(rcpt_to)
             local_set = @api.local_rcpts(addresses).to_set
@@ -85,7 +85,8 @@ module MailOnRails
             inbound_id = nil
             if local.any?
               source = @ingress.stamp(data, mail_from: mail_from, rcpt_to: local,
-                                      authenticated_as: authenticated_as, auth_results: auth_results)
+                                      authenticated_as: authenticated_as, auth_results: auth_results,
+                                      scan_status: scan_status)
               next { error: "inbound ingress refused the message", code: :internal } unless @ingress.deliver(source)
 
               inbound_id = Digest::SHA256.hexdigest(source)[0, 12]
@@ -93,6 +94,28 @@ module MailOnRails
 
             { id: inbound_id || "outbound", outbound: remote.size }
           end
+        end
+
+        # Best-effort delivery of an infected/unscanned copy to the app for
+        # quarantine review, after the SMTP reply (550/451) has already been
+        # decided by the scan verdict. Targets the local recipients; for an
+        # authenticated remote-only submission, falls back to the sender's
+        # own account. Never raises and returns nothing meaningful - a lost
+        # review copy is logged, not turned into a different SMTP answer
+        # (downgrading a 550 to 451 would make infected senders retry
+        # forever; the app-side mailroom dedups retry copies by Message-ID).
+        def quarantine(mail_from, rcpt_to, data, authenticated_as, auth_results:, scan_status:, virus: nil)
+          local = @api.local_rcpts(Array(rcpt_to))
+          targets = local.any? ? local : [ authenticated_as ].compact
+          return log(:warn, "quarantine copy dropped: no local target (#{scan_status})") if targets.empty?
+
+          source = @ingress.stamp(data, mail_from: mail_from, rcpt_to: targets,
+                                  authenticated_as: authenticated_as, auth_results: auth_results,
+                                  scan_status: scan_status, virus: virus)
+          log(:error, "quarantine copy refused by ingress (#{scan_status})") unless @ingress.deliver(source)
+          nil
+        rescue StandardError => e
+          log(:error, "quarantine copy failed: #{e.class}: #{e.message}")
         end
 
         private

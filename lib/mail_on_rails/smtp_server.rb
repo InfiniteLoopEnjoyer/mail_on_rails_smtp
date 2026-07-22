@@ -4,6 +4,7 @@ require "mail_on_rails/smtp/config"
 require "mail_on_rails/smtp/server"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/smtp/sender_auth"
+require "mail_on_rails/smtp/clamav_client"
 
 module MailOnRails
   # SMTP server (RFC 5321 subset), run on a thread by Smtp::Daemon -
@@ -413,7 +414,32 @@ module MailOnRails
           end
         end
 
-        result = @store.smtp_store(@mail_from, @rcpt_to, body, @authenticated_as, auth_results: auth_results)
+        # Virus scan after the cheap rejects (loop/DMARC) so refused mail
+        # never costs a clamd round-trip. Policy: infected -> hard 550 plus a
+        # stamped review copy quarantined app-side; scanner unreachable ->
+        # 451 so the sending MTA retries (nothing skips scanning), also
+        # quarantining an "unscanned" copy for review (deduped app-side by
+        # Message-ID across those retries). The quarantine POST result never
+        # changes the reply - the verdict alone decided it.
+        scan = scan_message(body)
+        if scan&.infected?
+          @store.log(:warn, "SMTP rejected message from <#{@mail_from}>: virus #{scan.virus} (#{peer_ip})")
+          @store.quarantine(@mail_from, @rcpt_to, body, @authenticated_as,
+                            auth_results: auth_results, scan_status: "infected", virus: scan.virus)
+          reply 550, "5.7.1 Message rejected: virus detected (#{scan.virus})"
+          reset
+          return
+        elsif scan&.unavailable?
+          @store.log(:error, "SMTP tempfail for message from <#{@mail_from}>: virus scanner unavailable (#{peer_ip})")
+          @store.quarantine(@mail_from, @rcpt_to, body, @authenticated_as,
+                            auth_results: auth_results, scan_status: "unscanned")
+          reply 451, "4.7.1 Virus scanner unavailable, try again later"
+          reset
+          return
+        end
+
+        result = @store.smtp_store(@mail_from, @rcpt_to, body, @authenticated_as,
+                                   auth_results: auth_results, scan_status: scan && "clean")
         if result[:code] == :insufficient_storage
           @store.log(:warn, "SMTP message from <#{@mail_from}> refused: insufficient storage (#{peer_ip})")
           reply 452, "Insufficient system storage, try later"
@@ -441,6 +467,18 @@ module MailOnRails
       rescue StandardError => e
         @store.log(:error, "SMTP sender verification error: #{e.class}: #{e.message}")
         nil
+      end
+
+      # ClamAV verdict for the message body, nil when scanning is disabled
+      # (no clamd address configured). Per-listener spec keys override the
+      # env-derived defaults, mirroring max_message_bytes - and doubling as
+      # the test seam, since worker Ractors cannot read ENV at runtime.
+      def scan_message(body)
+        addr = @spec.fetch(:clamav_addr, Smtp::ClamavClient::ADDR).to_s
+        return nil if addr.empty?
+
+        timeout = @spec[:clamav_timeout] || Smtp::ClamavClient::TIMEOUT
+        Smtp::ClamavClient.new(addr: addr, timeout: timeout).scan(body)
       end
 
       def recipient_summary

@@ -96,6 +96,53 @@ class HttpStoreTest < Minitest::Test
     assert_includes @ingress.deliveries.last, "X-MailOnRails-Authenticated: no\r\n"
   end
 
+  test "smtp_store stamps the clean scan verdict on the ingress payload" do
+    account_id
+    store.smtp_store("sender@remote.test", [ EMAIL ], MailOnRails::Smtp::Store::Contracts::Smtp::RAW, nil,
+                     scan_status: "clean")
+    assert_includes @ingress.deliveries.last, "X-MailOnRails-Scan: clean\r\n"
+  end
+
+  test "quarantine stamps and delivers a review copy to the local recipients" do
+    account_id
+    store.quarantine("sender@remote.test", [ EMAIL, "stranger@elsewhere.test" ],
+                     MailOnRails::Smtp::Store::Contracts::Smtp::RAW, nil,
+                     auth_results: "spf=fail", scan_status: "infected", virus: "Eicar-Test-Signature")
+
+    source = @ingress.deliveries.last
+    refute_nil source
+    assert_includes source, "X-MailOnRails-Scan: infected\r\n"
+    assert_includes source, "X-MailOnRails-Virus: Eicar-Test-Signature\r\n"
+    assert_includes source, "X-Original-To: #{EMAIL}\r\n"
+    refute_includes source, "X-Original-To: stranger@elsewhere.test"
+  end
+
+  test "quarantine falls back to the authenticated sender for remote-only submissions" do
+    account_id
+    store.quarantine(EMAIL, [ "friend@elsewhere.test" ], MailOnRails::Smtp::Store::Contracts::Smtp::RAW, EMAIL,
+                     auth_results: nil, scan_status: "unscanned")
+
+    source = @ingress.deliveries.last
+    refute_nil source
+    assert_includes source, "X-Original-To: #{EMAIL}\r\n"
+    assert_includes source, "X-MailOnRails-Scan: unscanned\r\n"
+  end
+
+  test "quarantine never raises when the api or ingress is down" do
+    account_id
+    down = Object.new
+    def down.local_rcpts(*) = raise(Errno::ECONNREFUSED)
+    broken = MailOnRails::Smtp::Store::Http.new(api: down, ingress: @ingress, logger: Logger.new(IO::NULL))
+
+    assert_nil broken.quarantine("s@remote.test", [ EMAIL ], "raw", nil,
+                                 auth_results: nil, scan_status: "infected", virus: "X")
+
+    refusing = MailOnRails::Smtp::Store::Http.new(api: @api, ingress: RecordingIngress.new(accept: false),
+                                                  logger: Logger.new(IO::NULL))
+    assert_nil refusing.quarantine("s@remote.test", [ EMAIL ], "raw", nil,
+                                   auth_results: nil, scan_status: "infected", virus: "X")
+  end
+
   test "smtp_store surfaces an ingress refusal as the internal envelope" do
     account_id
     refusing = MailOnRails::Smtp::Store::Http.new(api: @api, ingress: RecordingIngress.new(accept: false),

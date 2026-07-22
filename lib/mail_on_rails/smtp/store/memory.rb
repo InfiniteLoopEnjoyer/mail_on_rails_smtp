@@ -16,7 +16,7 @@ module MailOnRails
       # credentials, and +inbound_messages+ / +outbound_messages+ to inspect
       # the spool (the SMTP interface deliberately has no read side).
       class Memory
-        attr_reader :inbound_messages, :outbound_messages
+        attr_reader :inbound_messages, :outbound_messages, :quarantined_messages
 
         def initialize(spool_limit: 10_000, outbound_limit: 1_000, logger: nil)
           @spool_limit = spool_limit
@@ -26,6 +26,7 @@ module MailOnRails
           @counters = Hash.new(0)
           @inbound_messages = []
           @outbound_messages = []
+          @quarantined_messages = []
           @lock = Monitor.new
         end
 
@@ -64,7 +65,7 @@ module MailOnRails
           end
         end
 
-        def smtp_store(mail_from, rcpt_to, data, authenticated_as, auth_results: nil)
+        def smtp_store(mail_from, rcpt_to, data, authenticated_as, auth_results: nil, scan_status: nil)
           @lock.synchronize do
             addresses = Array(rcpt_to)
             known = @accounts.values.map { |a| a[:email] }
@@ -82,7 +83,7 @@ module MailOnRails
               inbound_id = next_id(:inbound)
               @inbound_messages << {
                 id: inbound_id, mail_from: mail_from, rcpt_to: local, data: data,
-                authenticated_as: authenticated_as, auth_results: auth_results
+                authenticated_as: authenticated_as, auth_results: auth_results, scan_status: scan_status
               }
             end
             remote.each do |recipient|
@@ -91,6 +92,28 @@ module MailOnRails
               }
             end
             { id: inbound_id || "outbound", outbound: remote.size }
+          end
+        end
+
+        # Best-effort review copy of infected/unscanned mail; the SMTP reply
+        # was already decided from the scan verdict, so this records and
+        # never fails the caller (see Store::Http#quarantine for the
+        # production semantics it mirrors).
+        def quarantine(mail_from, rcpt_to, data, authenticated_as, auth_results:, scan_status:, virus: nil)
+          @lock.synchronize do
+            known = @accounts.values.map { |a| a[:email] }
+            local = Array(rcpt_to).map { |a| normalize(a) }.uniq.select { |a| known.include?(a) }
+            targets = local.any? ? local : [ authenticated_as ].compact
+            if targets.empty?
+              log(:warn, "quarantine copy dropped: no local target (#{scan_status})")
+              return nil
+            end
+            @quarantined_messages << {
+              id: next_id(:quarantine), mail_from: mail_from, rcpt_to: targets, data: data,
+              authenticated_as: authenticated_as, auth_results: auth_results,
+              scan_status: scan_status, virus: virus
+            }
+            nil
           end
         end
 

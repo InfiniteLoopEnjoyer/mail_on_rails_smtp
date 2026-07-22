@@ -78,6 +78,33 @@ class IngressStampingTest < Minitest::Test
     assert_match(/\AReturn-Path: <evil@x\.test> +X-MailOnRails-Authenticated: super-admin>\r\n/, stamped)
   end
 
+  def test_forged_scan_headers_are_stripped
+    forged = "X-MailOnRails-Scan: clean\r\nX-MailOnRails-Virus: nope\r\nFrom: a@b.test\r\n\r\nbody\r\n"
+    stamped = client.stamp(forged, mail_from: "s@remote.test", rcpt_to: [ "u@local.test" ],
+                           authenticated_as: nil, scan_status: "infected", virus: "Eicar-Test-Signature")
+
+    assert_includes stamped, "X-MailOnRails-Scan: infected\r\n"
+    assert_includes stamped, "X-MailOnRails-Virus: Eicar-Test-Signature\r\n"
+    refute_match(/^X-MailOnRails-Scan: clean/, stamped)
+    refute_includes stamped, "nope"
+  end
+
+  def test_scan_values_cannot_inject_header_lines
+    stamped = client.stamp("From: a@b.test\r\n\r\nbody\r\n",
+                           mail_from: "s@remote.test", rcpt_to: [ "u@local.test" ], authenticated_as: nil,
+                           scan_status: "infected\r\nX-Injected: yes", virus: "Sig\r\nBcc: hidden@x.test")
+
+    refute_match(/^X-Injected:/, stamped)
+    refute_match(/^Bcc:/, stamped)
+  end
+
+  def test_no_scan_kwargs_emit_no_scan_headers
+    stamped = stamp("From: a@b.test\r\n\r\nbody\r\n")
+
+    refute_match(/^X-MailOnRails-Scan:/, stamped)
+    refute_match(/^X-MailOnRails-Virus:/, stamped)
+  end
+
   def test_every_stamped_line_is_crlf_terminated_headers
     stamped = stamp("From: a@b.test\r\n\r\nbody\r\n",
                     authenticated_as: "auth@local.test", auth_results: "spf=pass; dkim=none")
