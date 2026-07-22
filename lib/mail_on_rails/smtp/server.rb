@@ -3,6 +3,7 @@
 require "socket"
 require "etc"
 require_relative "conn_limiter"
+require_relative "auth_throttle"
 require_relative "tls"
 require_relative "worker"
 
@@ -21,14 +22,16 @@ module MailOnRails
     #     numbers over per-worker control pipes, round-robin. Requires a
     #     store that can be rebuilt inside each Ractor, i.e. one that
     #     implements #worker_config (Store::Http does). Session completions
-    #     come back as bytes on a shared release pipe and free ConnLimiter
-    #     slots.
+    #     come back as "<ip>\n" lines on a shared release pipe (freeing
+    #     ConnLimiter slots), authentication failures as "<ip>\n" lines on a
+    #     shared auth pipe (feeding AuthThrottle).
     #   - Thread mode: worker threads popping one shared queue. Used when
     #     the store is an injected in-process instance (tests, embedded
     #     development) or when MAIL_ON_RAILS_SMTP_WORKER_MODE=thread.
     #
-    # The ConnLimiter always lives on the accept side, so the cap stays
-    # exact process-wide in both modes.
+    # The ConnLimiter and AuthThrottle always live on the accept side, so
+    # the connection caps (process-wide and per-IP) and the per-IP
+    # auth-failure lockout stay exact across both modes.
     #
     # Subclasses define MAX_CONNECTIONS and the protocol specifics:
     # protocol_name, busy_line (sent when the connection cap is hit),
@@ -42,6 +45,13 @@ module MailOnRails
       KEEPALIVE_INTERVAL = 10
       KEEPALIVE_PROBES = 5
 
+      # Per-IP anti-abuse defaults; protocol subclasses override (with
+      # env-driven values). nil/0 disables. Enforced on the accept side -
+      # worker Ractors are isolated, so shared abuse state lives here.
+      MAX_CONNECTIONS_PER_IP = nil
+      AUTH_LOCKOUT_FAILURES = nil
+      AUTH_LOCKOUT_SECONDS = 900
+
       def self.run(store, listeners, tls_material, workers: nil)
         new(store, listeners, tls_material, workers: workers).run
       end
@@ -50,7 +60,9 @@ module MailOnRails
         @store = store
         @listeners = listeners
         @tls_material = tls_material
-        @limiter = ConnLimiter.new(self.class::MAX_CONNECTIONS)
+        @limiter = ConnLimiter.new(self.class::MAX_CONNECTIONS, per_ip: self.class::MAX_CONNECTIONS_PER_IP)
+        @throttle = AuthThrottle.new(limit: self.class::AUTH_LOCKOUT_FAILURES,
+                                     window: self.class::AUTH_LOCKOUT_SECONDS)
         @worker_count = [ workers || Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_WORKERS") { Etc.nprocessors }), 1 ].max
         @dispatchers = []
         @round_robin = 0
@@ -97,7 +109,9 @@ module MailOnRails
 
       def spawn_ractor_workers(session_specs)
         release_r, @release_w = IO.pipe
+        auth_r, @auth_w = IO.pipe
         Thread.new { release_loop(release_r) }
+        Thread.new { auth_failure_loop(auth_r) }
         ready_port = Ractor::Port.new
         store_config = Ractor.make_shareable(@store.worker_config)
         material = @tls_material && Ractor.make_shareable(@tls_material.dup)
@@ -105,7 +119,8 @@ module MailOnRails
         Array.new(@worker_count) do
           _ractor, control_w = Worker.spawn_ractor(
             session_class: session_class, specs: session_specs, tls_material: material,
-            store_config: store_config, release_fd: @release_w.fileno, ready_port: ready_port
+            store_config: store_config, release_fd: @release_w.fileno,
+            auth_fd: @auth_w.fileno, ready_port: ready_port
           )
           control_w.sync = true
           control_w
@@ -116,19 +131,39 @@ module MailOnRails
         queue = Thread::Queue.new
         @worker_count.times do
           worker = Worker.new(store: @store, session_class: session_class, tls: tls,
-                              on_done: -> { @limiter.release })
+                              on_done: ->(ip) { @limiter.release(ip) },
+                              on_auth_failure: ->(ip) { record_auth_failure(ip) })
           Thread.new { worker.serve_queue(queue) }
         end
         [ queue ]
       end
 
-      # Every byte a worker writes is one finished session.
+      # Every line a worker writes is one finished session ("<ip>\n", bare
+      # newline when the peer address was unavailable), freeing its slots.
       def release_loop(release_r)
-        while (batch = release_r.readpartial(4096))
-          batch.bytesize.times { @limiter.release }
+        while (line = release_r.gets)
+          ip = line.chomp
+          @limiter.release(ip.empty? ? nil : ip)
         end
-      rescue EOFError, IOError
+      rescue IOError
         nil
+      end
+
+      # Every line a worker writes is one failed authentication ("<ip>\n").
+      def auth_failure_loop(auth_r)
+        while (line = auth_r.gets)
+          ip = line.chomp
+          record_auth_failure(ip) unless ip.empty?
+        end
+      rescue IOError
+        nil
+      end
+
+      def record_auth_failure(ip)
+        return unless @throttle.record(ip) == :locked
+
+        @store.log(:warn, "#{protocol_name} locking out #{ip} for #{self.class::AUTH_LOCKOUT_SECONDS}s " \
+                          "after #{self.class::AUTH_LOCKOUT_FAILURES} failed authentication attempts")
       end
 
       def accept_loop(spec, session_spec, spec_index)
@@ -136,36 +171,48 @@ module MailOnRails
         loop do
           socket = server.accept
           tune_keepalive(socket)
-          if @limiter.acquire
-            dispatch(socket, session_spec, spec_index)
+          ip = peer_ip(socket)
+          if @throttle.locked?(ip)
+            reject(socket, locked_line) # before acquire: locked IPs must not consume slots
+          elsif @limiter.acquire(ip)
+            dispatch(socket, session_spec, spec_index, ip)
           else
-            reject_busy(socket)
+            reject(socket, busy_line)
           end
         end
       rescue StandardError => e
         @store.log(:error, "#{protocol_name} listener #{spec[:port]} died: #{e.class}: #{e.message}")
       end
 
-      def dispatch(socket, session_spec, spec_index)
+      def dispatch(socket, session_spec, spec_index, ip)
         target = @mutex.synchronize do
           @round_robin += 1
           @dispatchers[@round_robin % @dispatchers.size]
         end
         if target.is_a?(Thread::Queue)
-          target.push([ socket, session_spec ])
+          target.push([ socket, session_spec, ip ])
         else
           # The worker Ractor owns the fd from here; keep our IO object from
           # closing it behind the worker's back when GC collects it.
           socket.autoclose = false
-          target.write("#{socket.fileno} #{spec_index}\n")
+          target.write("#{socket.fileno} #{spec_index} #{ip}\n")
         end
       rescue StandardError
-        @limiter.release
+        @limiter.release(ip)
         begin
           socket.close
         rescue StandardError
           nil
         end
+      end
+
+      # The peer address at accept time, threaded through dispatch and the
+      # release path so both sides of the per-IP accounting use the same
+      # key. nil when the peer vanished before getpeername.
+      def peer_ip(socket)
+        socket.remote_address.ip_address
+      rescue StandardError
+        nil
       end
 
       # TCP_KEEP* constants are platform-dependent (macOS has no
@@ -179,12 +226,16 @@ module MailOnRails
         nil
       end
 
-      def reject_busy(socket)
-        socket.write("#{busy_line}\r\n")
+      def reject(socket, line)
+        socket.write("#{line}\r\n")
         socket.close
       rescue StandardError
         nil
       end
+
+      # Sent to connections from locked-out IPs; protocol subclasses may
+      # override with a more specific message.
+      def locked_line = busy_line
     end
   end
 end

@@ -15,14 +15,18 @@ module MailOnRails
     #
     #   Ractor mode (Worker.spawn_ractor): one Worker per core, each inside
     #   its own Ractor for true parallelism. Sockets cross the boundary as
-    #   raw fd numbers over a control pipe ("<fd> <spec index>\n" lines) and
-    #   are re-wrapped with TCPSocket.for_fd - fds are process-global, and
-    #   integers avoid Ractor IO moves entirely (moved IOs misbehave under a
-    #   fiber scheduler on Ruby 4.0.6; see scheduler.rb). The worker builds
-    #   its own store and TLS context inside the Ractor - neither can be
-    #   shared across the boundary - and reports each finished session by
-    #   writing a byte to the shared release pipe, which the accept side
-    #   turns into ConnLimiter releases.
+    #   raw fd numbers over a control pipe ("<fd> <spec index> <peer ip>\n"
+    #   lines) and are re-wrapped with TCPSocket.for_fd - fds are
+    #   process-global, and integers avoid Ractor IO moves entirely (moved
+    #   IOs misbehave under a fiber scheduler on Ruby 4.0.6; see
+    #   scheduler.rb). The worker builds its own store and TLS context
+    #   inside the Ractor - neither can be shared across the boundary - and
+    #   reports each finished session as an "<ip>\n" line on the shared
+    #   release pipe (the accept side turns those into ConnLimiter releases)
+    #   and each failed authentication as an "<ip>\n" line on the shared
+    #   auth pipe (feeding the accept side's AuthThrottle). The peer IP is
+    #   captured accept-side and threaded through, so both sides of the
+    #   per-IP accounting use the same key even if the peer vanishes.
     #
     #   Thread mode (Worker#serve_queue): same serving core on a plain
     #   thread, fed [socket, spec] pairs through a Thread::Queue and sharing
@@ -38,11 +42,12 @@ module MailOnRails
       # spec[:handshake_timeout].
       HANDSHAKE_TIMEOUT = 30
 
-      def initialize(store:, session_class:, tls: nil, on_done: nil)
+      def initialize(store:, session_class:, tls: nil, on_done: nil, on_auth_failure: nil)
         @store = store
         @session_class = session_class
         @tls = tls
-        @on_done = on_done
+        @on_done = on_done               # called with the peer IP per finished session
+        @on_auth_failure = on_auth_failure # called with the peer IP per failed AUTH
       end
 
       # Thread mode entry point. Runs until the queue is closed.
@@ -56,8 +61,8 @@ module MailOnRails
         serve do
           line = control_r.gets
           if line
-            fd, index = line.split.map { |v| Integer(v) }
-            [ TCPSocket.for_fd(fd), specs.fetch(index) ]
+            fd, index, ip = line.split
+            [ TCPSocket.for_fd(Integer(fd)), specs.fetch(Integer(index)), ip ]
           end
         end
       end
@@ -66,21 +71,26 @@ module MailOnRails
       # All arguments must be shareable: session_class is a Class,
       # specs/tls_material/store_config are deep-frozen data,
       # release_fd/ready_port are an Integer and a Port.
-      def self.spawn_ractor(session_class:, specs:, tls_material:, store_config:, release_fd:, ready_port:)
+      def self.spawn_ractor(session_class:, specs:, tls_material:, store_config:, release_fd:, auth_fd:, ready_port:)
         ractor = Ractor.new(session_class, specs, tls_material, store_config,
-                            release_fd, ready_port) do |session_class, specs, tls_material, store_config, release_fd, ready_port|
+                            release_fd, auth_fd, ready_port) do |session_class, specs, tls_material, store_config, release_fd, auth_fd, ready_port|
           control_r, control_w = IO.pipe
           ready_port.send(control_w.fileno)
 
           release = IO.for_fd(release_fd)
           release.autoclose = false # the accept side owns this fd
           release.sync = true
+          auth = IO.for_fd(auth_fd)
+          auth.autoclose = false
+          auth.sync = true
 
           store = store_config.fetch(:store_class).from_config(store_config[:config] || {})
           tls = tls_material && TLS::ContextProvider.new(tls_material)
           # Explicit constant: self inside a Ractor block is the Ractor.
+          # Single short pipe writes stay atomic, so workers can share fds.
           Worker.new(store: store, session_class: session_class, tls: tls,
-                     on_done: -> { release.write("d") }).serve_pipe(control_r, specs)
+                     on_done: ->(ip) { release.write("#{ip}\n") },
+                     on_auth_failure: ->(ip) { auth.write("#{ip}\n") if ip }).serve_pipe(control_r, specs)
           :worker_exit
         end
         [ ractor, IO.for_fd(ready_port.receive) ]
@@ -96,21 +106,27 @@ module MailOnRails
         Fiber.set_scheduler(Scheduler.new)
         Fiber.schedule do
           loop do
-            socket, spec = supplier.call
+            socket, spec, ip = supplier.call
             break unless socket
 
-            Fiber.schedule { handle(socket, spec) }
+            Fiber.schedule { handle(socket, spec, ip) }
           end
         end
       end
 
-      def handle(socket, spec)
+      def handle(socket, spec, ip = nil)
         ctx = @tls&.context
         if spec[:tls] == :implicit && ctx
           socket.timeout = spec[:handshake_timeout] || HANDSHAKE_TIMEOUT if socket.respond_to?(:timeout=)
           socket = TLS.accept(socket, ctx)
         end
-        @session_class.new(socket, @store, spec, ctx).run
+        session = @session_class.new(socket, @store, spec, ctx)
+        # Sessions that support it report failed AUTHs so the accept side's
+        # per-IP throttle sees attempts across connections.
+        if ip && @on_auth_failure && session.respond_to?(:on_auth_failure=)
+          session.on_auth_failure = -> { @on_auth_failure.call(ip) }
+        end
+        session.run
       rescue OpenSSL::SSL::SSLError, IOError, SystemCallError
         nil # session logs its own protocol-level errors; this is connection debris
       ensure
@@ -119,7 +135,7 @@ module MailOnRails
         rescue StandardError
           nil
         end
-        @on_done&.call
+        @on_done&.call(ip)
       end
     end
   end

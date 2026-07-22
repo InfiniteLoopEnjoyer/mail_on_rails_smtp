@@ -319,7 +319,23 @@ Reliability, security, and feature work for `mail_on_rails_smtp`.
 
 ## B) Features — re-triaged
 
-### 12) Anti-abuse: per-IP caps + auth throttling — **P0, narrowed** *(absorbs #5, #8-auth)*
+### 12) Anti-abuse: per-IP caps + auth throttling — **P0 — DONE 2026-07-22** *(absorbs #5, #8-auth)*
+
+> **Resolved:** `ConnLimiter` gained a per-IP concurrent-connection cap
+> (`MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP`, default 10) and a new accept-side
+> `AuthThrottle` locks an IP out after repeated failed AUTHs
+> (`MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES`/`_SECONDS`, default 10 failures
+> / 15 min, quiet-period decay, table sweep). `0` disables either. The
+> Ractor boundary is solved by threading the accept-time peer IP through the
+> control pipe (`"<fd> <idx> <ip>"`) and back on the now line-based release
+> pipe, plus a second auth-failure pipe; sessions report failures via an
+> optional `on_auth_failure` writer so `Session.new` signatures are
+> unchanged. Locked IPs get `421` at accept (tempfail — shared-IP legit mail
+> is delayed, not lost) without consuming a limiter slot. Validated by
+> `conn_limiter_test.rb` + `auth_throttle_test.rb` (unit, injected clock)
+> and four integration tests in `worker_pool_test.rb` covering both features
+> in both worker modes — all four confirmed to fail (second connection
+> welcomed with 220) against the unfixed code.
 **Analysis**
 - The one genuinely missing production feature. Today a single IP can: hold all
   100 connection slots (300 s idle each, or forever via N1), and stuff

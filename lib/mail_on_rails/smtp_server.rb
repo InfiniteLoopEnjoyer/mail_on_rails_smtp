@@ -29,6 +29,14 @@ module MailOnRails
     MAX_MESSAGES_PER_SESSION = 100
     MAX_AUTH_ATTEMPTS = 3
     MAX_CONNECTIONS = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_MAX_CONN", 100))
+    # Per-IP anti-abuse, enforced on the accept side (ConnLimiter /
+    # AuthThrottle): concurrent-connection cap per peer IP, and a lockout
+    # after repeated failed AUTHs (which otherwise cost the host app an HTTP
+    # credential check each, MAX_AUTH_ATTEMPTS per connection, fresh on
+    # every reconnect). 0 disables either.
+    MAX_CONNECTIONS_PER_IP = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP", 10))
+    AUTH_LOCKOUT_FAILURES = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES", 10))
+    AUTH_LOCKOUT_SECONDS = Integer(ENV.fetch("MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS", 900))
     # Protocol tracing default; per-listener spec[:trace] overrides. Read at
     # load time because worker Ractors cannot access ENV.
     TRACE_DEFAULT = ENV["MAIL_ON_RAILS_SMTP_TRACE"] == "1"
@@ -40,12 +48,18 @@ module MailOnRails
 
     def busy_line = "421 Too many connections, try later"
 
+    def locked_line = "421 Too many failed authentication attempts, try later"
+
     def listener_label(spec) = "#{spec[:port]}/#{spec[:tls]}/#{spec[:role]}"
 
     def session_class = Session
 
     class Session
       include Smtp::SessionHelpers
+
+      # Set by Worker when per-IP auth throttling is active: a no-arg
+      # callable invoked once per failed authentication attempt.
+      attr_writer :on_auth_failure
 
       def initialize(socket, store, spec, tls_ctx)
         @socket = socket
@@ -56,6 +70,7 @@ module MailOnRails
         @trace = spec.fetch(:trace, TRACE_DEFAULT)
         @authenticated_as = nil
         @auth_attempts = 0
+        @on_auth_failure = nil
         @message_count = 0
         @continuation = nil
         reset
@@ -246,6 +261,7 @@ module MailOnRails
           reply 235, "Authentication successful"
         else
           @auth_attempts += 1
+          @on_auth_failure&.call # recorded before the reply so the throttle can't lag the client
           @store.log(:warn, "SMTP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
           if @auth_attempts >= MAX_AUTH_ATTEMPTS
             reply 421, "Too many failed authentication attempts"

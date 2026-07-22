@@ -2,7 +2,9 @@
 
 A standalone SMTP server (RFC 5321 subset): MX + submission listeners with
 STARTTLS/implicit TLS, AUTH, SPF/DKIM/DMARC verification of inbound mail,
-and DoS caps. Designed as the mail-receiving frontend for a Rails app.
+and anti-abuse controls (global and per-IP connection caps, per-IP
+auth-failure lockout). Designed as the mail-receiving frontend for a
+Rails app.
 
 The daemon holds **no database credentials and no Rails**: credential
 checks, recipient validation, and outbound queueing are HTTP calls to the
@@ -86,6 +88,9 @@ surfaces:
 | `MAIL_ON_RAILS_DMARC_ENFORCE` | off | `1` rejects on DMARC policy |
 | `MAIL_ON_RAILS_DNS_TIMEOUT` | `5` | Seconds per DNS lookup in sender verification |
 | `MAIL_ON_RAILS_SMTP_MAX_CONN` | `100` | Connection cap |
+| `MAIL_ON_RAILS_SMTP_MAX_CONN_PER_IP` | `10` | Concurrent connections per peer IP (`0` disables) |
+| `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_FAILURES` | `10` | Failed AUTHs per IP before lockout (`0` disables) |
+| `MAIL_ON_RAILS_SMTP_AUTH_LOCKOUT_SECONDS` | `900` | Lockout duration; also the failure-decay window |
 | `MAIL_ON_RAILS_SMTP_WORKERS` | CPU cores | Session worker count |
 | `MAIL_ON_RAILS_SMTP_WORKER_MODE` | auto | `thread` forces thread workers (no Ractors) |
 | `MAIL_ON_RAILS_SMTP_TRACE` | off | `1` debug-logs the protocol exchange (credentials redacted, DATA payloads omitted) |

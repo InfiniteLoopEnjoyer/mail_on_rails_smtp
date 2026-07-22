@@ -35,6 +35,19 @@ class WorkerPoolTest < Minitest::Test
     MAX_CONNECTIONS = 1
   end
 
+  # Roomy global cap but one connection per IP: a 421 here proves the
+  # per-IP limiter refused, not the global one.
+  class OnePerIpServer < MailOnRails::SmtpServer
+    MAX_CONNECTIONS = 10
+    MAX_CONNECTIONS_PER_IP = 1
+  end
+
+  # Locks an IP out after two failed AUTHs, for long enough to outlast a test.
+  class LockoutServer < MailOnRails::SmtpServer
+    AUTH_LOCKOUT_FAILURES = 2
+    AUTH_LOCKOUT_SECONDS = 60
+  end
+
   def setup
     @cleanup = []
   end
@@ -131,13 +144,7 @@ class WorkerPoolTest < Minitest::Test
     assert_match(/\A220 /, read_reply(client))
     assert_match(/STARTTLS/, command(client, "EHLO client.test"))
     assert_match(/\A220 /, command(client, "STARTTLS"))
-
-    ctx = OpenSSL::SSL::SSLContext.new
-    ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
-    tls = OpenSSL::SSL::SSLSocket.new(client, ctx)
-    tls.sync_close = true
-    tls.connect
-    @cleanup << -> { tls.close rescue nil }
+    tls = tls_wrap(client)
 
     assert_match(/AUTH PLAIN LOGIN/, command(tls, "EHLO client.test"))
     token = [ "\0#{EMAIL}\0#{PASSWORD}" ].pack("m0")
@@ -182,6 +189,45 @@ class WorkerPoolTest < Minitest::Test
 
     assert_match(/\A221 /, command(holder, "QUIT"))
     assert wait_for_free_slot(spec), "slot was not released after QUIT"
+  end
+
+  def test_per_ip_connection_cap_and_release
+    spec = start_server(memory_store, roles: [ [ :mx, :starttls ] ], server_class: OnePerIpServer).first
+
+    holder = connect(spec)
+
+    assert_match(/\A220 /, read_reply(holder))
+
+    refused = connect(spec)
+
+    assert_match(/\A421 /, read_reply(refused), "second connection from the same IP must be refused")
+
+    assert_match(/\A221 /, command(holder, "QUIT"))
+    assert wait_for_free_slot(spec), "per-IP slot was not released after QUIT"
+  end
+
+  # Wrong-password AUTHs across ONE connection must lock the IP for the NEXT
+  # connection - the throttle spans connections, unlike MAX_AUTH_ATTEMPTS.
+  def test_auth_lockout_refuses_subsequent_connections
+    spec = start_server(memory_store, roles: [ [ :submission, :starttls ] ],
+                        tls_material: tls_material, server_class: LockoutServer).first
+
+    client = connect(spec)
+    read_reply(client)
+    command(client, "EHLO client.test")
+    command(client, "STARTTLS")
+    tls = tls_wrap(client)
+    command(tls, "EHLO client.test")
+    bad = [ "\0#{EMAIL}\0wrong-password" ].pack("m0")
+
+    assert_match(/\A535 /, command(tls, "AUTH PLAIN #{bad}"))
+    assert_match(/\A535 /, command(tls, "AUTH PLAIN #{bad}"))
+    command(tls, "QUIT")
+
+    # Thread mode records failures synchronously, so the lock is already set.
+    locked = connect(spec)
+
+    assert_match(/\A421 /, read_reply(locked), "the IP must be locked out on its next connection")
   end
 
   # A peer that connects to the implicit-TLS port and never speaks must not
@@ -241,6 +287,45 @@ class WorkerPoolTest < Minitest::Test
     end
   end
 
+  # Same as the thread-mode test, but here the peer IP must cross to the
+  # worker on the control pipe and come back on the release pipe.
+  def test_ractor_mode_per_ip_cap_and_release_via_pipes
+    spec = start_server(RactorSafeStore.new, roles: [ [ :mx, :starttls ] ], server_class: OnePerIpServer).first
+
+    holder = connect(spec)
+
+    assert_match(/\A220 /, read_reply(holder))
+
+    refused = connect(spec)
+
+    assert_match(/\A421 /, read_reply(refused), "second connection from the same IP must be refused")
+
+    assert_match(/\A221 /, command(holder, "QUIT"))
+    assert wait_for_free_slot(spec), "per-IP slot was not released via the release pipe"
+  end
+
+  # Auth failures must cross the worker Ractor boundary (auth pipe) to reach
+  # the accept side's throttle. RactorSafeStore fails every authentication.
+  def test_ractor_mode_auth_lockout_via_pipe
+    spec = start_server(RactorSafeStore.new, roles: [ [ :submission, :starttls ] ],
+                        tls_material: tls_material, server_class: LockoutServer).first
+
+    client = connect(spec)
+    read_reply(client)
+    command(client, "EHLO client.test")
+    command(client, "STARTTLS")
+    tls = tls_wrap(client)
+    command(tls, "EHLO client.test")
+    bad = [ "\0nobody@example.test\0nope" ].pack("m0")
+
+    assert_match(/\A535 /, command(tls, "AUTH PLAIN #{bad}"))
+    assert_match(/\A535 /, command(tls, "AUTH PLAIN #{bad}"))
+    command(tls, "QUIT")
+
+    # The failure reports travel over a pipe; poll for the lockout to land.
+    assert wait_for_lockout(spec), "auth failures did not reach the accept-side throttle"
+  end
+
   def test_ractor_mode_release_pipe_frees_slots
     spec = start_server(RactorSafeStore.new, roles: [ [ :mx, :starttls ] ], server_class: TinyServer).first
 
@@ -257,6 +342,30 @@ class WorkerPoolTest < Minitest::Test
   end
 
   private
+
+  # Client-side TLS over an established socket (after a 220 STARTTLS go-ahead).
+  def tls_wrap(client)
+    ctx = OpenSSL::SSL::SSLContext.new
+    ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    tls = OpenSSL::SSL::SSLSocket.new(client, ctx)
+    tls.sync_close = true
+    tls.connect
+    @cleanup << -> { tls.close rescue nil }
+    tls
+  end
+
+  # Polls until a fresh connection is refused with 421 (lockout engaged).
+  def wait_for_lockout(spec)
+    40.times do
+      client = connect(spec)
+      reply = read_reply(client)
+      client.close
+      return true if reply.start_with?("421")
+
+      sleep 0.05
+    end
+    false
+  end
 
   # Polls until a full TLS handshake + 220 banner succeeds. While the slot
   # is still held, the 421 busy line arrives as plaintext and fails the
