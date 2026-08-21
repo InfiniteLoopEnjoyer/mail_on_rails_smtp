@@ -24,7 +24,7 @@ module MailOnRails
       module_function
 
       def start(logger:, tls_dir:)
-        Daemon.start(store: Store::SmtpBackend.new, logger: logger, tls_dir: tls_dir,
+        Daemon.start(store: MailOnRails::Store::SmtpBackend.new, logger: logger, tls_dir: tls_dir,
                      hostname: method(:hostname))
       end
 

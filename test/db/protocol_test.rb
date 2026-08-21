@@ -28,6 +28,21 @@ class SmtpProtocolTest < Minitest::Test
     assert_equal MailOnRails::Smtp::Protocol, MailOnRails::Runtime.adapter(:smtp)
   end
 
+  # Inside module Smtp, a bare `Store` is Smtp::Store (the memory store's
+  # namespace) - the adapter must reach the Active Record backend by its
+  # full name or the production boot dies with a NameError.
+  test "start hands the daemon the Active Record store" do
+    captured = nil
+    original = MailOnRails::Smtp::Daemon.method(:start)
+    MailOnRails::Smtp::Daemon.define_singleton_method(:start) { |store:, **| captured = store; :handle }
+    begin
+      assert_equal :handle, MailOnRails::Smtp::Protocol.start(logger: MailOnRails.logger, tls_dir: nil)
+    ensure
+      MailOnRails::Smtp::Daemon.define_singleton_method(:start, original)
+    end
+    assert_instance_of MailOnRails::Store::SmtpBackend, captured
+  end
+
   test "a boot without explicit TLS material raises, naming the pair" do
     with_tls_env({}) do
       error = assert_raises(RuntimeError) { MailOnRails::Smtp::Protocol.require_explicit_tls! }
