@@ -69,9 +69,19 @@ Unset, development serves every installed protocol and other environments
 serve none in-process (run `bin/mail_server`). `config.mail_on_rails.protocols`
 is the initializer equivalent.
 
-SMTP-only deployments still need a job runner (Solid Queue or similar)
-for the mailroom (Action Mailbox routing of accepted mail) and outbound
-delivery - both live in the core gem as Active Jobs.
+**Solid Queue is required.** This gem is only the edge: a
+`bin/mail_server` process runs no job worker, and everything after
+accept is an Active Job in the core gem - Action Mailbox routing of
+accepted mail into mailboxes, outbound delivery
+(`DeliverSmtpOutboundJob`, a recurring job every ~15 s), report sending,
+DKIM rotation, pruning. Without a Solid Queue supervisor and a recurring
+schedule against the same database, inbound mail sits unrouted in
+`action_mailbox_inbound_emails` and submitted mail sits unsent in
+`smtp_outbound_messages`. The reference schedule is
+[mail_on_rails_admin](https://github.com/InfiniteLoopEnjoyer/mail_on_rails_admin)'s
+`config/recurring.yml`; run it on a sibling `bin/jobs` process (or the
+web role, as that app does). A standalone mode that runs Solid Queue
+inside `bin/mail_server` is on the todo list.
 
 ## Configuration
 
