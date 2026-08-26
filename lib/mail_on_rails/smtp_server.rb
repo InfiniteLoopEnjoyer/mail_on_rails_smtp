@@ -698,7 +698,7 @@ module MailOnRails
 
         if (zone = rbl_listing)
           @store.log(:info, "SMTP rejected MAIL FROM:<#{from}> from #{peer_ip}: listed by DNSBL #{zone}")
-          return reply 554, "5.7.1 Service unavailable; client host [#{peer_ip}] blocked using #{zone}"
+          return reply 554, "5.7.1 Service unavailable; client host #{address_literal(peer_ip)} blocked using #{zone}"
         end
 
         # RFC 6409: the envelope sender must be an identity the login
@@ -1458,12 +1458,19 @@ module MailOnRails
         with << "A" if @authenticated_as
         helo = @helo_name.to_s.empty? ? "unknown" : sanitize_reply(@helo_name)
         source = if (dns = client_dns)
-          "#{sanitize_reply(dns.ptr_name || "unknown")} [#{peer_ip}]"
+          "#{sanitize_reply(dns.ptr_name || "unknown")} #{address_literal(peer_ip)}"
         else
-          "[#{peer_ip}]"
+          address_literal(peer_ip)
         end
         "Received: from #{helo} (#{source})\r\n" \
         "\tby #{server_name} with #{with}; #{Time.now.rfc2822}\r\n"
+      end
+
+      # RFC 5321 §4.1.3 address literal: "[203.0.113.9]" for IPv4, tagged
+      # "[IPv6:2001:db8::25]" for IPv6 - the form downstream trace parsers
+      # and DNSBL-style filters expect.
+      def address_literal(ip)
+        ip.to_s.include?(":") ? "[IPv6:#{ip}]" : "[#{ip}]"
       end
 
       # Postal-style mail loop detection: a message whose headers show it
