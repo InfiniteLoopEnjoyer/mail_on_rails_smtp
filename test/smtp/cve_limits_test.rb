@@ -121,16 +121,18 @@ class CveLimitsTest < Minitest::Test
     end
   end
 
-  # The largest EHLO that still fits one line must be handled promptly and
-  # echoed sanitized - bounded memory, no pathological handling near the cap.
+  # The largest legal EHLO (RFC 5321's 255-octet domain cap, MAX_HELO_BYTES)
+  # must be handled promptly and echoed sanitized; one octet more is a 501
+  # even though it still fits the line - a name that long is never a host.
   def test_maximum_length_valid_ehlo_is_answered_promptly
     with_session do |client|
       read_reply(client)
-      name = "a" * (MAX_LINE - 100)
+      name = "a" * MailOnRails::SmtpServer::MAX_HELO_BYTES
       reply = timed_command(client, "EHLO #{name}")
 
       assert_match(/\A250/, reply)
       reply.split("\r\n").each { |line| assert_match(/\A\d{3}[ -]/, line, "reply line must stay well-formed") }
+      assert_match(/\A501/, timed_command(client, "EHLO #{name}a"))
     end
   end
 

@@ -275,6 +275,34 @@ class SmtpCveContentTest < Minitest::Test
                  "no single From: subject makes DMARC a permerror, not a pass"
   end
 
+  # The wire half of the same class: permerror was never a pass, but it was
+  # never p=reject either - so an enforcing MX accepted the duplicate-From
+  # message that enforcement exists to refuse. Under SMTP_DMARC_ENFORCE=1
+  # the session now answers 550 before any verification runs.
+  def test_duplicate_from_header_is_refused_at_data_under_dmarc_enforcement
+    previous = ENV["SMTP_DMARC_ENFORCE"]
+    ENV["SMTP_DMARC_ENFORCE"] = "1"
+    singleton = MailOnRails::SenderAuth.singleton_class
+    original = MailOnRails::SenderAuth.method(:verify)
+    singleton.define_method(:verify) { |**| raise "verification must not be reached" }
+
+    with_session(spec_extra: { sender_auth: true }) do |client|
+      read_reply(client)
+      command(client, "EHLO mail.example.com")
+      command(client, "MAIL FROM:<alice@example.com>")
+      command(client, "RCPT TO:<#{EMAIL}>")
+      command(client, "DATA")
+      client.write("From: alice@example.com\r\nFrom: attacker@evil.test\r\nSubject: hi\r\n\r\nbody\r\n")
+      assert_match(/\A550 5\.7\.1 /, command(client, "."))
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.inbound_messages, "the spoof must not be spooled"
+  ensure
+    singleton.define_method(:verify, original)
+    previous ? ENV["SMTP_DMARC_ENFORCE"] = previous : ENV.delete("SMTP_DMARC_ENFORCE")
+  end
+
   # =========================================================================
   # Class: cert_validation (outbound SMTP client TLS policy)
   # =========================================================================

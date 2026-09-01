@@ -28,11 +28,11 @@ class TlsFailureTest < Minitest::Test
 
   # -- STARTTLS teardown under a live server ---------------------------------
 
-  def start_server(store)
+  def start_server(store, spec_extra = {})
     listener = TCPServer.new("127.0.0.1", 0)
     @cleanup << -> { listener.close rescue nil }
     spec = { host: "127.0.0.1", port: listener.addr[1], tls: :starttls, role: :mx,
-             hostname: "mx.test", tcp_server: listener }
+             hostname: "mx.test", tcp_server: listener }.merge(spec_extra)
     thread = Thread.new { MailOnRails::SmtpServer.run(store, [ spec ], tls_material) }
     @cleanup << -> { thread.kill }
     spec
@@ -101,6 +101,30 @@ class TlsFailureTest < Minitest::Test
     assert_server_still_serves(spec)
   end
 
+  # A peer that says STARTTLS and then sends nothing used to hold its
+  # thread for the 300 s command timeout; the handshake now runs under
+  # the accept-side HANDSHAKE_TIMEOUT (spec[:handshake_timeout] is the
+  # same seam Netserv::Server uses for implicit TLS).
+  def test_silent_peer_after_starttls_is_dropped_at_the_handshake_timeout
+    spec = start_server(MailOnRails::Smtp::Store::Memory.new, handshake_timeout: 1)
+    client = starttls_go_ahead(spec)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    begin
+      assert_nil client.gets("\r\n"), "the silent handshake must be dropped"
+    rescue SystemCallError
+      # a reset also proves the teardown
+    end
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    assert_operator elapsed, :<, 4, "the drop must follow the 1 s handshake bound, not the command timeout"
+
+    assert_server_still_serves(spec)
+  end
+
+  def test_starttls_handshake_bound_defaults_to_the_accept_side_constant
+    assert_equal 30, MailOnRails::Netserv::Server::HANDSHAKE_TIMEOUT
+  end
+
   # -- ContextProvider: live cert renewal (the certbot flow) -----------------
 
   def write_pems(dir, pems)
@@ -120,7 +144,7 @@ class TlsFailureTest < Minitest::Test
   def test_context_provider_reloads_renewed_certs_without_restart
     Dir.mktmpdir do |dir|
       cert, key = write_pems(dir, TLS.generate_self_signed)
-      provider = TLS::ContextProvider.new(cert_path: cert, key_path: key)
+      provider = TLS::ContextProvider.new({ cert_path: cert, key_path: key })
       before = provider.context
 
       assert_same before, provider.context, "untouched files must keep the cached context"
@@ -135,7 +159,7 @@ class TlsFailureTest < Minitest::Test
   def test_context_provider_keeps_serving_the_old_cert_through_a_broken_renewal
     Dir.mktmpdir do |dir|
       cert, key = write_pems(dir, TLS.generate_self_signed)
-      provider = TLS::ContextProvider.new(cert_path: cert, key_path: key)
+      provider = TLS::ContextProvider.new({ cert_path: cert, key_path: key })
       before = provider.context
 
       File.write(cert, "not a pem") # a renewal caught mid-write
@@ -148,7 +172,7 @@ class TlsFailureTest < Minitest::Test
   def test_context_provider_recovers_once_the_renewal_completes
     Dir.mktmpdir do |dir|
       cert, key = write_pems(dir, TLS.generate_self_signed)
-      provider = TLS::ContextProvider.new(cert_path: cert, key_path: key)
+      provider = TLS::ContextProvider.new({ cert_path: cert, key_path: key })
       before = provider.context
 
       File.write(cert, "not a pem")

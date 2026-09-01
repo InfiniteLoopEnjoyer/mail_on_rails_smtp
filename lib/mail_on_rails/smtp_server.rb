@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "time"
+require "digest"
 require "securerandom"
 require "mail_on_rails/settings"
 require "mail_on_rails/netserv/config"
@@ -37,6 +38,14 @@ module MailOnRails
     # blow the scanner's cap (which fails closed as a 451, forever).
     MAX_MESSAGE_BYTES = 24 * 1024 * 1024
     MAX_LINE = 4096
+    # RFC 5321 4.5.3.1.1 caps a domain at 255 octets; the HELO name is
+    # echoed into every Received header we stamp.
+    MAX_HELO_BYTES = 255
+    # Process-wide cap on sessions inside a DATA/BDAT payload at once. Each
+    # holds up to max_message_bytes of body in memory, so without this the
+    # aggregate is max_conn x 24 MB from as many idle-until-DATA peers.
+    # Beyond it DATA earns a 452 (retry later), not a drop.
+    MAX_CONCURRENT_DATA = 16
     MAX_RECEIVED_HOPS = 4
     MAX_RECIPIENTS = 100
     MAX_MESSAGES_PER_SESSION = 100
@@ -96,6 +105,32 @@ module MailOnRails
       # answering whether this peer's IP is currently locked out.
       attr_writer :on_auth_failure, :auth_locked
 
+      # The MAX_CONCURRENT_DATA counter, shared by every session in the
+      # process (all listeners, all roles - the memory is one pool).
+      @data_slots = 0
+      @data_slots_lock = Mutex.new
+
+      class << self
+        # true when a slot was taken; the caller owns its release.
+        def acquire_data_slot(limit)
+          @data_slots_lock.synchronize do
+            return false if @data_slots >= limit
+
+            @data_slots += 1
+            true
+          end
+        end
+
+        def release_data_slot
+          @data_slots_lock.synchronize { @data_slots -= 1 if @data_slots.positive? }
+        end
+
+        # Sessions currently inside a payload (tests, ops).
+        def data_slots_in_use
+          @data_slots_lock.synchronize { @data_slots }
+        end
+      end
+
       def initialize(socket, store, spec, tls_ctx)
         @socket = socket
         @store = store
@@ -117,6 +152,7 @@ module MailOnRails
         @honeypot = false
         @honeypot_fired = false
         @honeypot_event_id = nil
+        @data_slot = false
         reset
       end
 
@@ -166,6 +202,9 @@ module MailOnRails
         @close_reason = "session_error"
         @store.log(:error, "SMTP session error: #{e.class}: #{e.message}")
       ensure
+        # A session that dies mid-payload (EOF, overflow, timeout) still
+        # holds its DATA slot until here.
+        release_data_slot
         close_socket
       end
 
@@ -195,6 +234,28 @@ module MailOnRails
         @dsn_ret = nil
         @dsn_envid = nil
         @bdat = nil
+        # Every transaction end passes through here (finish_data, RSET,
+        # HELO, STARTTLS), which is also where an in-transfer BDAT gets
+        # abandoned - so the slot goes back here too.
+        release_data_slot
+      end
+
+      # -- concurrent DATA cap (MAX_CONCURRENT_DATA) -------------------------
+
+      def max_concurrent_data
+        @spec[:max_concurrent_data] || MAX_CONCURRENT_DATA
+      end
+
+      # true when this session holds (or just took) a slot.
+      def acquire_data_slot
+        @data_slot ||= Session.acquire_data_slot(max_concurrent_data)
+      end
+
+      def release_data_slot
+        return unless @data_slot
+
+        @data_slot = false
+        Session.release_data_slot
       end
 
       def close_socket
@@ -219,9 +280,12 @@ module MailOnRails
         redacted = redact_for_trace(line)
         trace "<= #{redacted}"
         honeypot_transcript.inbound(redacted)
-        # Exploit-probe payloads are recognised and refused, never dispatched -
-        # the ban lands on the first hit. DATA/AUTH continuations bypass this
-        # method, so a mail body full of ${...} shell noise can't false-positive.
+        # Exploit-probe payloads are recognised and refused, never dispatched.
+        # The event is recorded for the dashboard; the response is observe-
+        # only (HoneypotEvent#decide_response only throttles canary logins -
+        # a regex hit is too false-positive-prone to act on automatically).
+        # DATA/AUTH continuations bypass this method, so a mail body full of
+        # ${...} shell noise can't false-positive.
         if (signature = Netserv::ProbeSignatures.match(line))
           trigger_honeypot("exploit_probe", signature: signature)
           # A VRFY probe gets the same reply an innocuous VRFY would -
@@ -270,7 +334,7 @@ module MailOnRails
         when "AUTH" then auth(arg)
         when "MAIL" then mail_from(arg)
         when "RCPT" then rcpt_to(arg)
-        when "DATA" then data
+        when "DATA" then return data
         when "BDAT" then return bdat(arg)
         when "RSET" then reset; reply 250, "2.0.0 Ok"
         when "NOOP" then reply 250, "2.0.0 Ok"
@@ -305,7 +369,7 @@ module MailOnRails
       # in progress (RFC 5321 4.1.4).
       def helo(verb, arg)
         name = arg.to_s.strip
-        unless name.match?(/\A[A-Za-z0-9\[\].:_-]+\z/)
+        unless name.bytesize <= MAX_HELO_BYTES && name.match?(/\A[A-Za-z0-9\[\].:_-]+\z/)
           return error_reply 501, "5.5.2 Syntactically invalid #{verb.upcase} argument"
         end
 
@@ -368,6 +432,12 @@ module MailOnRails
         @spec[:timeout] || 300
       end
 
+      # The STARTTLS handshake bound - the same cap Netserv::Server puts on
+      # the implicit-TLS handshake, and the same spec key.
+      def handshake_timeout
+        @spec[:handshake_timeout] || Netserv::Server::HANDSHAKE_TIMEOUT
+      end
+
       def ehlo(_arg)
         extensions = [ server_name, "SIZE #{max_message_bytes}", "8BITMIME", "PIPELINING",
                        "ENHANCEDSTATUSCODES", "CHUNKING",
@@ -420,6 +490,11 @@ module MailOnRails
         return reply 454, "4.7.0 TLS not available due to local problem" unless @tls_ctx
 
         reply 220, "2.0.0 Ready to start TLS"
+        # The handshake runs under the short handshake bound, not the 300 s
+        # command timeout: a peer that says STARTTLS and goes silent would
+        # otherwise park this thread (and its connection slot) for the
+        # full idle window.
+        set_timeout(handshake_timeout)
         @socket = Netserv::Tls.accept(io_for(@socket), @tls_ctx)
         @tls = true
         set_timeout(read_timeout)
@@ -427,6 +502,10 @@ module MailOnRails
         # pre-handshake HELO included.
         @helo_name = nil
         reset
+      rescue IO::TimeoutError
+        @store.log(:info, "SMTP STARTTLS handshake timed out (#{peer_ip})")
+        @close_reason = "tls_handshake_timeout"
+        raise IOError, "TLS handshake timed out"
       rescue OpenSSL::SSL::SSLError => e
         @store.log(:error, "SMTP STARTTLS failed: #{e.message}")
         raise IOError, "TLS handshake failed"
@@ -438,7 +517,9 @@ module MailOnRails
         unless @spec[:role] == :submission
           return error_reply 503, "5.5.1 AUTH not available on this listener"
         end
-        return reply 538, "5.7.11 Encryption required for requested authentication mechanism" unless @tls
+        # Counts against the error budget like any other misplaced AUTH: a
+        # client hammering plaintext AUTH on 587 is a scanner, not a typo.
+        return error_reply 538, "5.7.11 Encryption required for requested authentication mechanism" unless @tls
         return error_reply 503, "5.5.1 Already authenticated" if @authenticated_as
         # RFC 4954: AUTH is illegal once a mail transaction is open.
         return error_reply 503, "5.5.1 AUTH not permitted in mail transaction" if @mail_from
@@ -919,16 +1000,33 @@ module MailOnRails
 
       # -- data --------------------------------------------------------------
 
+      # Returns :quit when the session cap closes the connection.
       def data
         return error_reply 503, "5.5.1 Need RCPT command first" if @rcpt_to.empty?
         # RFC 3030 4.2: DATA and BDAT cannot mix within one transaction.
         return error_reply 503, "5.5.1 BDAT transaction in progress" if @bdat
-        if @message_count >= max_messages_per_session
-          return reply 421, "4.7.0 Error: too many messages"
-        end
+        return message_cap_reached if @message_count >= max_messages_per_session
+        return data_slots_exhausted unless acquire_data_slot
 
         reply 354, "End data with <CR><LF>.<CR><LF>"
         @continuation = data_continuation
+        nil
+      end
+
+      # RFC 5321 4.2.1: a 421 is "closing transmission channel" - the
+      # reply is only honest if the close follows it.
+      def message_cap_reached
+        reply 421, "4.7.0 Error: too many messages"
+        @close_reason = "message_cap"
+        :quit
+      end
+
+      # Every DATA slot is taken: a temporary refusal the sender retries,
+      # the same code the store's queue-full answer uses.
+      def data_slots_exhausted
+        @store.log(:warn, "SMTP DATA from <#{@mail_from}> deferred: #{max_concurrent_data} messages already in transfer (#{peer_ip})")
+        reply 452, "4.3.1 Insufficient system storage, try again later"
+        nil
       end
 
       # -- BDAT (RFC 3030 CHUNKING) ------------------------------------------
@@ -960,12 +1058,17 @@ module MailOnRails
 
         if @rcpt_to.empty? || (@message_count >= max_messages_per_session && !@bdat)
           discard_exactly(size)
-          if @rcpt_to.empty?
-            error_reply 503, "5.5.1 Need RCPT command first"
-          else
-            reply 421, "4.7.0 Error: too many messages"
-          end
+          return message_cap_reached unless @rcpt_to.empty?
+
+          error_reply 503, "5.5.1 Need RCPT command first"
           return nil
+        end
+
+        # The first chunk opens the transfer and takes the DATA slot; a
+        # refused one is still consumed for framing.
+        if @bdat.nil? && !acquire_data_slot
+          discard_exactly(size)
+          return data_slots_exhausted
         end
 
         @bdat ||= { body: +"".b, consumed: 0 }
@@ -1078,7 +1181,10 @@ module MailOnRails
           capture_relay_attempt(body)
           @message_count += 1
           @store.log(:info, "SMTP honeypot blackholed message from <#{@mail_from}> to #{recipient_summary} (#{peer_ip})")
-          reply 250, "2.0.0 Ok: queued as #{SecureRandom.hex(8).upcase}"
+          # A real acceptance pays a scanner round-trip before its 250; an
+          # instant one would fingerprint the blackhole.
+          sleep(rand(0.05..0.3))
+          reply 250, "2.0.0 Ok: queued as #{fake_queue_id}"
           reset
           return
         end
@@ -1104,6 +1210,18 @@ module MailOnRails
 
         auth_results = nil
         if @spec[:role] == :mx && !@authenticated_as && sender_auth?
+          # DMARC's subject is the one From: domain (RFC 7489 6.6.1). No
+          # From:, two of them, or a multi-mailbox one leaves no subject:
+          # the evaluator answers permerror, and p=reject never applied -
+          # so a second From: line was a way past enforcement. Under
+          # enforcement that shape is refused before any DNS is spent.
+          if SenderAuth.enforce_dmarc? && SenderAuth::FromHeader.domain(body).nil?
+            @store.log(:info, "SMTP rejected message from <#{@mail_from}>: no single From domain for DMARC (#{peer_ip})")
+            reply 550, "5.7.1 Message must carry exactly one From address"
+            reset
+            return
+          end
+
           verdict = verify_sender(body)
           if verdict == :error
             # A verifier bug is not a verdict: under enforcement a missing
@@ -1150,6 +1268,11 @@ module MailOnRails
             record_dmarc_event(verdict, disposition: disposition)
           end
         end
+
+        # The store's idempotency key (SmtpReceipt): envelope plus the body
+        # exactly as received. Taken before our Received header, whose
+        # timestamp would differ on the redelivery it exists to catch.
+        digest = message_digest(body)
 
         # Our own trace header, prepended after the loop check (so we count
         # only prior hops) and before storage - RFC 5321 wants every
@@ -1228,7 +1351,7 @@ module MailOnRails
                                    client_ip: peer_ip, helo: @helo_name,
                                    auth_results: auth_results, scan_status: scan && "clean",
                                    requiretls: @mail_requiretls, smtputf8: @mail_smtputf8,
-                                   dsn: dsn_envelope)
+                                   dsn: dsn_envelope, digest: digest)
         if result[:code] == :insufficient_storage
           @store.log(:warn, "SMTP message from <#{@mail_from}> refused: insufficient storage (#{peer_ip})")
           reply 452, "4.3.1 Insufficient system storage, try later"
@@ -1236,7 +1359,16 @@ module MailOnRails
           @store.log(:warn, "SMTP message from <#{@mail_from}> refused: relay denied (#{peer_ip})")
           reply 550, "5.7.1 Relaying denied"
         elsif result[:error]
+          # The store already logged the failure detail; the wire gets a
+          # fixed generic tempfail, never the exception text.
           reply 451, "4.3.0 Requested action aborted: local error in processing"
+        elsif result[:duplicate]
+          # A redelivery of a message we already hold (the sender never saw
+          # its 250): stored nowhere, but the 250 it needs is still owed.
+          @message_count += 1
+          @store.log(:info, "SMTP duplicate redelivery from <#{@mail_from}> to #{recipient_summary}: " \
+                            "already accepted, not stored again (#{peer_ip})")
+          reply 250, "2.0.0 Ok: queued as #{result[:id]}"
         else
           @message_count += 1
           auth_note = @authenticated_as ? ", auth #{@authenticated_as}" : ""
@@ -1245,6 +1377,21 @@ module MailOnRails
           reply 250, "2.0.0 Ok: queued as #{result[:id]}"
         end
         reset
+      end
+
+      # SHA-256 over the envelope (sender, recipients in a canonical order)
+      # and the body as received - what a conformant sender resends
+      # byte-for-byte after losing our 250.
+      def message_digest(body)
+        Digest::SHA256.hexdigest([ @mail_from.to_s.downcase, *@rcpt_to.map(&:downcase).sort, body ].join("\0"))
+      end
+
+      # A blackholed submission's queue id in the shape a real acceptance
+      # returns: the InboundEmail integer id for local recipients, the
+      # literal "outbound" for a relay.
+      def fake_queue_id
+        local = @store.local_rcpts(@rcpt_to)[:local]
+        Array(local).any? ? SecureRandom.random_number(1_000..99_999_999) : "outbound"
       end
 
       # The transaction's DSN request (RFC 3461) as one value for the

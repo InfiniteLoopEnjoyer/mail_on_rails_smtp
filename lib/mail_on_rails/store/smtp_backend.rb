@@ -36,8 +36,10 @@ module MailOnRails
     class SmtpBackend < Base
       # Headers a remote sender must not be able to forge: stripped from
       # the submitted DATA before we stamp authoritative values from the
-      # SMTP session.
-      TRUSTED_HEADERS = /\A(X-Original-To|X-MailOnRails-[\w-]+|Return-Path):/i
+      # SMTP session. WSP before the colon is RFC 5322 obs-syntax the Mail
+      # gem (and so the mailroom) accepts as the same field name, so
+      # "X-Original-To : victim" must be stripped like the strict spelling.
+      TRUSTED_HEADERS = /\A(X-Original-To|X-MailOnRails-[\w-]+|Return-Path)[ \t]*:/i
 
       def authenticate(email, password, ip: nil, source: "smtp")
         super
@@ -73,8 +75,17 @@ module MailOnRails
         end
       end
 
+      # digest: the session's SHA-256 over the envelope and the body as
+      # received (before our Received header), the SMTP-layer idempotency
+      # key. A sender whose connection died between our persist and its
+      # read of the 250 redelivers the identical message; the receipt row
+      # makes that second copy a no-op (still answered 250) instead of a
+      # second InboundEmail/outbound row. The receipt is claimed inside the
+      # same transaction as the persist, so a store failure rolls it back
+      # and the sender's retry is a first delivery again.
       def smtp_store(mail_from, rcpt_to, data, authenticated_as, client_ip: nil, helo: nil,
-                     auth_results: nil, scan_status: nil, requiretls: false, smtputf8: false, dsn: nil)
+                     auth_results: nil, scan_status: nil, requiretls: false, smtputf8: false, dsn: nil,
+                     digest: nil)
         db do
           local, remote = partition_recipients(rcpt_to)
           # Inbound mail to a canary address is blackholed: the RCPT already
@@ -89,17 +100,22 @@ module MailOnRails
             next { error: "outbound queue full", code: :insufficient_storage }
           end
 
-          inbound_id = nil
-          if local.any?
-            stamped = stamp(data, mail_from: mail_from, rcpt_to: local,
-                            authenticated_as: authenticated_as, client_ip: client_ip, helo: helo)
-            inbound_id = ActionMailbox::InboundEmail.create_and_extract_message_id!(stamped).id
-          end
-          # Per-recipient DSN requests arrive keyed by the address as the
-          # client wrote it; the queue rows carry normalized addresses.
-          rcpt_dsn = (dsn&.dig(:recipients) || {}).transform_keys { |a| a.to_s.strip.downcase }
-          outbound_sender = outbound_mail_from(mail_from, authenticated_as)
-          SmtpOutboundMessage.transaction do
+          SmtpReceipt.transaction do
+            if digest && !SmtpReceipt.claim(digest)
+              log(:info, "SMTP duplicate redelivery #{digest[0, 12]} from <#{mail_from}>: not stored again")
+              next { id: "duplicate", outbound: 0, duplicate: true }
+            end
+
+            inbound_id = nil
+            if local.any?
+              stamped = stamp(data, mail_from: mail_from, rcpt_to: local,
+                              authenticated_as: authenticated_as, client_ip: client_ip, helo: helo)
+              inbound_id = ActionMailbox::InboundEmail.create_and_extract_message_id!(stamped).id
+            end
+            # Per-recipient DSN requests arrive keyed by the address as the
+            # client wrote it; the queue rows carry normalized addresses.
+            rcpt_dsn = (dsn&.dig(:recipients) || {}).transform_keys { |a| a.to_s.strip.downcase }
+            outbound_sender = outbound_mail_from(mail_from, authenticated_as)
             remote.each do |recipient|
               SmtpOutboundMessage.create!(mail_from: outbound_sender, recipient: recipient,
                                           data: data, next_attempt_at: Time.current,
@@ -108,8 +124,8 @@ module MailOnRails
                                           dsn_notify: rcpt_dsn.dig(recipient, :notify),
                                           dsn_orcpt: rcpt_dsn.dig(recipient, :orcpt))
             end
+            { id: inbound_id || "outbound", outbound: remote.size }
           end
-          { id: inbound_id || "outbound", outbound: remote.size }
         end
       end
 
@@ -276,9 +292,15 @@ module MailOnRails
         value.to_s.gsub(/[\r\n]/, " ")
       end
 
+      # Splits at line breaks not followed by WSP, so a folded field stays
+      # one element and goes with its continuation lines. The name is
+      # matched on the unfolded form: a fold between the name and the
+      # colon is still WSP-before-colon to a lenient parser.
       def strip_trusted_headers(raw)
         header_block, separator, body = raw.to_s.partition(/\r?\n\r?\n/)
-        kept = header_block.split(/\r?\n(?![ \t])/).reject { |line| line.match?(TRUSTED_HEADERS) }
+        kept = header_block.split(/\r?\n(?![ \t])/).reject do |field|
+          field.gsub(/\r?\n[ \t]+/, " ").match?(TRUSTED_HEADERS)
+        end
         kept.join("\r\n") + separator + body
       end
     end

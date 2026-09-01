@@ -67,6 +67,40 @@ class SmtpStampingTest < MailOnRails::Testing::Database::TestCase
     assert_includes stamped, "keep-me-3"
   end
 
+  # RFC 5322 obs-syntax: the Mail gem (and so the mailroom) reads
+  # "Name<WSP>:" as the field Name, so "X-Original-To : victim" would have
+  # routed to any local mailbox and "Return-Path : <x>" aimed vacation
+  # replies at x. Only the edge's own values may reach the parser.
+  test "trust headers with whitespace before the colon are stripped" do
+    forged = "X-Original-To : victim1@local.test\r\n" \
+             "X-Original-To\t: victim2@local.test\r\n" \
+             "X-Original-To \t : victim3@local.test\r\n" \
+             "Return-Path : <forged1@evil.test>\r\n" \
+             "Return-Path\t\t: <forged2@evil.test>\r\n" \
+             "X-MailOnRails-Authenticated : admin@local.test\r\n" \
+             "X-MailOnRails-Client-Ip\t: 6.6.6.6\r\n" \
+             "From: a@b.test\r\n\r\nbody\r\n"
+    stamped = stamp(forged, sender: "s@remote.test", rcpts: [ "u@local.test" ])
+    mail = Mail.new(stamped)
+
+    assert_equal [ "u@local.test" ], Array(mail["X-Original-To"]).map(&:value)
+    assert_equal "<s@remote.test>", Array(mail["Return-Path"]).map(&:value).join
+    assert_equal "no", Array(mail["X-MailOnRails-Authenticated"]).map(&:value).join
+    refute_match(/victim\d|forged\d|admin@local|6\.6\.6\.6/, stamped)
+    assert_includes stamped, "From: a@b.test"
+  end
+
+  test "a fold between the name and the colon is stripped with its continuation" do
+    forged = "X-Original-To\r\n : victim@local.test\r\n" \
+             "Return-Path\r\n\t: <forged@evil.test>\r\n" \
+             "From: a@b.test\r\n\r\nbody\r\n"
+    stamped = stamp(forged, sender: "s@remote.test", rcpts: [ "u@local.test" ])
+
+    refute_includes stamped, "victim@local.test"
+    refute_includes stamped, "forged@evil.test"
+    assert_equal [ "u@local.test" ], Array(Mail.new(stamped)["X-Original-To"]).map(&:value)
+  end
+
   test "body occurrences of trust headers are left alone" do
     body_hit = "From: a@b.test\r\n\r\nquoting a header X-MailOnRails-Authenticated: admin in the body\r\n"
     stamped = stamp(body_hit)

@@ -284,20 +284,66 @@ class SmtpConformanceTest < Minitest::Test
     end
   end
 
-  def test_message_cap_per_session_answers_421
+  # RFC 5321 4.2.1: 421 means "closing transmission channel", so the
+  # connection must actually close behind it. (Distinct bodies: identical
+  # ones would be deduped as a redelivery.)
+  def test_message_cap_per_session_answers_421_and_closes
     with_session(spec_extra: { max_messages: 2 }) do |client|
       start_session(client)
-      2.times do
+      2.times do |i|
         assert_match(/\A250/, command(client, "MAIL FROM:<a@b.test>"))
         assert_match(/\A250/, command(client, "RCPT TO:<#{EMAIL}>"))
         assert_match(/\A354/, command(client, "DATA"))
-        client.write("Subject: x\r\n\r\nbody\r\n")
+        client.write("Subject: x#{i}\r\n\r\nbody\r\n")
         assert_match(/\A250/, command(client, "."))
       end
       assert_match(/\A250/, command(client, "MAIL FROM:<a@b.test>"))
       assert_match(/\A250/, command(client, "RCPT TO:<#{EMAIL}>"))
       assert_match(/\A421/, command(client, "DATA"))
+      assert_nil client.gets("\r\n"), "the 421 must be followed by the close it announces"
+    end
+    assert_equal 2, @store.inbound_messages.size
+  end
+
+  def test_message_cap_per_session_applies_to_bdat_and_closes
+    with_session(spec_extra: { max_messages: 1 }) do |client|
+      start_session(client)
+      command(client, "MAIL FROM:<a@b.test>")
+      command(client, "RCPT TO:<#{EMAIL}>")
+      client.write("BDAT 20 LAST\r\nSubject: x\r\n\r\nbody\r\n")
+      assert_match(/\A250/, read_reply(client))
+      command(client, "MAIL FROM:<a@b.test>")
+      command(client, "RCPT TO:<#{EMAIL}>")
+      client.write("BDAT 5 LAST\r\nhello")
+      assert_match(/\A421/, read_reply(client))
+      assert_nil client.gets("\r\n")
+    end
+    assert_equal 1, @store.inbound_messages.size
+  end
+
+  # -- HELO/EHLO argument length (RFC 5321 4.5.3.1.1) -------------------------
+
+  def test_helo_argument_over_255_octets_is_a_syntax_error
+    with_session do |client|
+      read_reply(client)
+      assert_match(/\A501/, command(client, "EHLO #{"a" * 256}"))
+      assert_match(/\A501/, command(client, "HELO #{"a" * 256}"))
+      assert_match(/\A250/, command(client, "EHLO #{"a" * 255}"), "255 octets is the RFC maximum and still legal")
       command(client, "QUIT")
+    end
+  end
+
+  # -- AUTH before STARTTLS on submission counts toward the error budget -------
+
+  def test_plaintext_auth_on_submission_is_refused_and_exhausts_the_error_budget
+    with_session(role: :submission) do |client|
+      start_session(client)
+      budget = MailOnRails::SmtpServer::MAX_PROTOCOL_ERRORS
+      (budget - 1).times do
+        assert_match(/\A538 5\.7\.11 /, command(client, "AUTH PLAIN #{[ "\0a\0b" ].pack("m0")}"))
+      end
+      assert_match(/\A538 Too many/, command(client, "AUTH PLAIN #{[ "\0a\0b" ].pack("m0")}"))
+      assert_nil client.gets("\r\n"), "the exhausted budget must drop the connection"
     end
   end
 

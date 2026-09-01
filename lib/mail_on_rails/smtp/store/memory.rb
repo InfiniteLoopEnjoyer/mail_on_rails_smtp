@@ -32,6 +32,7 @@ module MailOnRails
           @honeypot_events = []
           @dmarc_events = []
           @banned_cidrs = []
+          @receipts = {} # digest => accepted-at, the SMTP-layer dedupe (Store::SmtpBackend's SmtpReceipt)
           # Keys the SCRAM decoy material; one random secret per store
           # instance is enough - determinism only has to hold within a
           # process (the app store derives its own from secret_key_base).
@@ -142,8 +143,12 @@ module MailOnRails
           end
         end
 
+        # digest: the session's idempotency key for this envelope + body; a
+        # digest already accepted is a redelivery after a lost 250, stored
+        # nowhere and answered as a duplicate (the session still says 250).
         def smtp_store(mail_from, rcpt_to, data, authenticated_as, client_ip: nil, helo: nil,
-                       auth_results: nil, scan_status: nil, requiretls: false, smtputf8: false, dsn: nil)
+                       auth_results: nil, scan_status: nil, requiretls: false, smtputf8: false, dsn: nil,
+                       digest: nil)
           @lock.synchronize do
             addresses = Array(rcpt_to)
             known = @accounts.values.map { |a| a[:email] }
@@ -157,6 +162,12 @@ module MailOnRails
             if (local.any? && @inbound_messages.size >= @spool_limit) ||
                (remote.any? && @outbound_messages.size + remote.size > @outbound_limit)
               return { error: "spool full", code: :insufficient_storage }
+            end
+
+            if digest
+              return { id: "duplicate", outbound: 0, duplicate: true } if @receipts.key?(digest)
+
+              @receipts[digest] = Time.now
             end
 
             inbound_id = nil

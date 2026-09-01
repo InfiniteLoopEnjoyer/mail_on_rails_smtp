@@ -89,6 +89,31 @@ class SmtpHoneypotSessionTest < Minitest::Test
     assert_includes transcript, "buy pills"
   end
 
+  # The fake queue id must not fingerprint the blackhole: a real acceptance
+  # answers "queued as <InboundEmail id>" for local recipients and "queued
+  # as outbound" for a relay, never a hex token.
+  def test_blackholed_reply_id_has_the_shape_of_a_real_acceptance
+    with_session do |client|
+      read_reply(client)
+      authenticate(client, CANARY, PASSWORD)
+      command(client, "MAIL FROM:<#{CANARY}>")
+      command(client, "RCPT TO:<victim@remote.test>")
+      command(client, "DATA")
+      client.write("Subject: spam\r\n\r\nbuy pills\r\n.\r\n")
+      assert_match(/\A250 2\.0\.0 Ok: queued as outbound\r\n\z/, read_reply(client))
+
+      command(client, "MAIL FROM:<#{CANARY}>")
+      command(client, "RCPT TO:<real@example.test>")
+      command(client, "DATA")
+      client.write("Subject: spam\r\n\r\nbuy pills\r\n.\r\n")
+      assert_match(/\A250 2\.0\.0 Ok: queued as \d+\r\n\z/, read_reply(client))
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.outbound_messages
+    assert_empty @store.inbound_messages
+  end
+
   def test_transcript_redacts_the_password
     with_session do |client|
       read_reply(client)

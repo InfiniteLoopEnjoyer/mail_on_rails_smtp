@@ -128,6 +128,116 @@ class SmtpSessionTest < Minitest::Test
     command(client, ".")
   end
 
+  # -- no single From: under DMARC enforcement ------------------------------
+  #
+  # DMARC's subject is the one From: domain; two From: lines (or none)
+  # leave the evaluator at permerror, which p=reject never applied to. Under
+  # enforcement that shape is refused outright, before any DNS.
+
+  TWO_FROMS = "From: alice@remote.test\r\nFrom: attacker@evil.test\r\nSubject: hi\r\n\r\nbody\r\n"
+
+  def deliver_raw(client, raw)
+    read_reply(client)
+    command(client, "EHLO client.test")
+    command(client, "MAIL FROM:<sender@remote.test>")
+    command(client, "RCPT TO:<#{EMAIL}>")
+    command(client, "DATA")
+    client.write(raw)
+    command(client, ".")
+  end
+
+  def test_mx_session_refuses_two_from_headers_under_dmarc_enforcement
+    with_dmarc_enforcement("1") do
+      recording_sender_verification do |calls|
+        with_session(spec_extra: { sender_auth: true }) do |client|
+          reply = deliver_raw(client, TWO_FROMS)
+          assert_match(/\A550 5\.7\.1 /, reply)
+          assert_match(/From/, reply)
+          command(client, "QUIT")
+        end
+        assert_empty calls, "no DNS is spent on a message with no DMARC subject"
+      end
+    end
+
+    assert_empty @store.inbound_messages
+  end
+
+  def test_mx_session_refuses_a_missing_from_header_under_dmarc_enforcement
+    with_dmarc_enforcement("1") do
+      recording_sender_verification do
+        with_session(spec_extra: { sender_auth: true }) do |client|
+          assert_match(/\A550 5\.7\.1 /, deliver_raw(client, "Subject: hi\r\n\r\nbody\r\n"))
+          command(client, "QUIT")
+        end
+      end
+    end
+
+    assert_empty @store.inbound_messages
+  end
+
+  def test_mx_session_accepts_two_from_headers_when_not_enforcing
+    with_dmarc_enforcement("0") do
+      recording_sender_verification do |calls|
+        with_session(spec_extra: { sender_auth: true }) do |client|
+          assert_match(/\A250 2\.0\.0 Ok: queued/, deliver_raw(client, TWO_FROMS))
+          command(client, "QUIT")
+        end
+        assert_equal 1, calls.size, "the verifier still runs (and records permerror) when observing"
+      end
+    end
+
+    assert_equal 1, @store.inbound_messages.size
+  end
+
+  def test_mx_session_still_accepts_a_single_from_under_dmarc_enforcement
+    with_dmarc_enforcement("1") do
+      recording_sender_verification do
+        with_session(spec_extra: { sender_auth: true }) do |client|
+          assert_match(/\A250 2\.0\.0 Ok: queued/, deliver_raw(client, RAW))
+          command(client, "QUIT")
+        end
+      end
+    end
+
+    assert_equal 1, @store.inbound_messages.size
+  end
+
+  # -- SMTP-layer idempotency (todo M12) -------------------------------------
+
+  def test_redelivering_the_same_message_is_stored_once_but_answered_250
+    with_session(spec_extra: { sender_auth: false }) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      2.times do
+        command(client, "MAIL FROM:<sender@remote.test>")
+        command(client, "RCPT TO:<#{EMAIL}>")
+        command(client, "DATA")
+        client.write(RAW)
+        assert_match(/\A250 2\.0\.0 Ok: queued as \S+/, command(client, "."))
+      end
+      command(client, "QUIT")
+    end
+
+    assert_equal 1, @store.inbound_messages.size, "the redelivery must not be spooled twice"
+  end
+
+  def test_a_different_body_on_the_same_envelope_is_a_new_message
+    with_session(spec_extra: { sender_auth: false }) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      [ RAW, RAW.sub("body line", "another body") ].each do |raw|
+        command(client, "MAIL FROM:<sender@remote.test>")
+        command(client, "RCPT TO:<#{EMAIL}>")
+        command(client, "DATA")
+        client.write(raw)
+        assert_match(/\A250/, command(client, "."))
+      end
+      command(client, "QUIT")
+    end
+
+    assert_equal 2, @store.inbound_messages.size
+  end
+
   def test_mx_session_refuses_mail_from_a_dnsbl_listed_ip
     with_session(spec_extra: { dnsbl: FakeDnsbl.new("bl.test") }) do |client|
       read_reply(client)
@@ -392,9 +502,11 @@ class SmtpSessionTest < Minitest::Test
     assert_match(/\A354/, command(client, "DATA"))
   end
 
+  # Framing tests send header-less bodies: sender policy (which refuses a
+  # From-less message under DMARC enforcement) is off, not under test.
   def test_bare_lf_dot_does_not_terminate_data
     without_sender_verification do
-      with_session do |client|
+      with_session(spec_extra: { sender_auth: false }) do |client|
         start_data(client)
         client.write("line one\r\n.\nline two\r\n.\r\n")
         assert_match(/\A250 2\.0\.0 Ok: queued/, read_reply(client))
@@ -411,7 +523,7 @@ class SmtpSessionTest < Minitest::Test
     max_line = MailOnRails::SmtpServer::MAX_LINE
     long_line = "a" * (max_line - 1) # + CRLF: the "\r" lands exactly at the chunk cap
     without_sender_verification do
-      with_session do |client|
+      with_session(spec_extra: { sender_auth: false }) do |client|
         start_data(client)
         client.write("#{long_line}\r\n.\r\n")
         assert_match(/\A250 2\.0\.0 Ok: queued/, read_reply(client))
@@ -616,7 +728,7 @@ class SmtpSessionTest < Minitest::Test
   def test_trace_excludes_data_payload
     logs = capture_store_logs
     without_sender_verification do
-      with_session(spec_extra: { trace: true }) do |client|
+      with_session(spec_extra: { trace: true, sender_auth: false }) do |client|
         start_data(client)
         client.write("Subject: secret-subject\r\n\r\nsecret-body-line\r\n.\r\n")
         assert_match(/\A250 2\.0\.0 Ok: queued/, read_reply(client))

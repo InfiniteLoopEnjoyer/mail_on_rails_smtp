@@ -163,6 +163,27 @@ module MailOnRails
             assert_equal 1, result[:outbound]
           end
 
+          # SMTP-layer idempotency: the session passes a digest of the
+          # envelope + body; a digest the store has already accepted is a
+          # redelivery after a lost 250 - not stored again, flagged
+          # :duplicate, but still carrying an id for the 250 the sender
+          # is owed. No digest means no dedupe.
+          def test_smtp_store_dedupes_a_redelivered_digest
+            account_id
+            digest = "d" * 64
+            first = store.smtp_store("sender@remote.test", [ EMAIL ], RAW, nil, digest: digest)
+            refute first[:duplicate], "the first delivery is stored"
+            assert first[:id]
+
+            second = store.smtp_store("sender@remote.test", [ EMAIL ], RAW, nil, digest: digest)
+            assert second[:duplicate], "the redelivery must be flagged"
+            assert second[:id], "the session still answers 250 with an id"
+            assert_equal 0, second[:outbound]
+
+            third = store.smtp_store("sender@remote.test", [ EMAIL ], RAW, nil, digest: "e" * 64)
+            refute third[:duplicate], "a different digest is a different message"
+          end
+
           def test_quarantine_returns_nil_for_local_recipients
             account_id
             assert_nil store.quarantine("sender@remote.test", [ EMAIL ], RAW, nil,
