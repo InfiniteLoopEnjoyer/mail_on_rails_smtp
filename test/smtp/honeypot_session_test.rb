@@ -199,4 +199,56 @@ class SmtpHoneypotSessionTest < Minitest::Test
       command(client, "QUIT")
     end
   end
+
+  # An HTTP scanner's request line: refused like any probe and recorded
+  # under its own trigger, so protocol_auto_ban can act on it.
+  def test_http_request_at_the_smtp_port_is_recorded_as_a_foreign_protocol
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      assert_match(/\A502/, command(client, "GET / HTTP/1.1"))
+      command(client, "Host: mx.test")
+      command(client, "QUIT")
+    end
+
+    assert_equal 1, @store.honeypot_events.size, "one event per session, not per line"
+    event = @store.honeypot_events.first
+    assert_equal "foreign_protocol", event[:trigger]
+    assert_equal "http_request", event[:signature]
+    assert_includes event[:transcript], "<= GET / HTTP/1.1"
+  end
+
+  # A scanner's binary blob (here a TLS ClientHello on the plaintext port)
+  # carries no CRLF, so it reaches the session as one unterminated chunk at
+  # EOF. It used to be blanked before the probe check ever saw it; now it
+  # is recorded and named.
+  def test_tls_handshake_on_the_plaintext_port_is_recorded_from_an_unterminated_chunk
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      client.write("\x16\x03\x01\x00\xf4\x01\x00\x00\xf0\x03\x03\xff\xfe".b)
+      client.close_write
+      client.read # drain until the session closes
+    end
+
+    event = @store.honeypot_events.first
+    assert_equal "foreign_protocol", event[:trigger]
+    assert_equal "tls_handshake", event[:signature]
+    refute_equal "session_error", @session.instance_variable_get(:@close_reason)
+  end
+
+  # Garbage is recorded but still dispatched - the parser's own refusal
+  # (502 unknown command here, a 501 for a NUL inside an address) is the
+  # reply, so the existing syntax-error behaviour is unchanged.
+  def test_garbage_bytes_are_recorded_and_refused_without_a_session_error
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      assert_match(/\A50[0-2]/, command(client, "b\x00/{m<;s3gMm>.4 ;1"))
+      assert_match(/\A50[0-2]/, command(client, "\xff\xfe junk".b))
+      assert_match(/\A221/, command(client, "QUIT"), "the session is still usable afterwards")
+    end
+
+    event = @store.honeypot_events.first
+    assert_equal "garbage", event[:trigger]
+    assert_equal "control_bytes", event[:signature]
+    refute_equal "session_error", @session.instance_variable_get(:@close_reason)
+  end
 end

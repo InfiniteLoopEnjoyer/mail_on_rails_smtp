@@ -278,21 +278,31 @@ module MailOnRails
         return @continuation.call(chunk) if @continuation
 
         line = line_from(chunk)
+        # Probe detection reads the raw chunk, terminated or not: a TLS
+        # ClientHello or a scanner's binary blob rarely carries a CRLF, so
+        # it arrives as an unterminated chunk that line_from blanks.
+        probe = Netserv::ProbeSignatures.detect(chunk.delete_suffix("\r\n"))
         redacted = redact_for_trace(line)
         trace "<= #{redacted}"
         honeypot_transcript.inbound(redacted)
-        # Exploit-probe payloads are recognised and refused, never dispatched.
-        # The event is recorded for the dashboard; the response is observe-
-        # only (HoneypotEvent#decide_response only throttles canary logins -
-        # a regex hit is too false-positive-prone to act on automatically).
-        # DATA/AUTH continuations bypass this method, so a mail body full of
-        # ${...} shell noise can't false-positive.
-        if (signature = Netserv::ProbeSignatures.match(line))
-          trigger_honeypot("exploit_probe", signature: signature)
+        # Exploit-probe payloads and foreign protocols (HTTP at a mail port)
+        # are recognised and refused, never dispatched. Garbage bytes are
+        # recorded the same way but still dispatched: the parser already
+        # refuses a NUL in an address or a non-UTF-8 SMTPUTF8 mailbox with
+        # the specific 501 the peer should see, and the event is what the
+        # detection is for. Whether the source is banned is
+        # HoneypotEvent#decide_response's call (observe-only unless the
+        # protocol_auto_ban setting is on). DATA/AUTH continuations bypass
+        # this method, so a mail body full of ${...} shell noise can't
+        # false-positive.
+        if probe
+          trigger, signature = probe
+          trigger_honeypot(trigger, signature: signature)
           # A VRFY probe gets the same reply an innocuous VRFY would -
           # answering "VRFY root" differently from "VRFY bob" would
           # fingerprint the honeypot. The event and ban have already landed.
-          return signature == "vrfy_privileged" ? vrfy : error_reply(502, "5.5.1 Command not implemented")
+          return vrfy if signature == "vrfy_privileged"
+          return error_reply(502, "5.5.1 Command not implemented") unless trigger == "garbage"
         end
         handle_command(line)
       end
