@@ -8,6 +8,7 @@ require "mail_on_rails/netserv/config"
 require "mail_on_rails/netserv/server"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/sender_auth"
+require "mail_on_rails/aggregate_report"
 require "mail_on_rails/smtp/dnsbl"
 require "mail_on_rails/smtp/fcrdns"
 require "mail_on_rails/clamav_client"
@@ -1243,18 +1244,18 @@ module MailOnRails
             # is the sanctioned local-policy override (RFC 7489 6.7).
             @store.log(:info, "SMTP accepting DMARC reject from <#{@mail_from}>: ARC chain from " \
                               "trusted sealer #{verdict.arc_sealer} (#{auth_results}, #{peer_ip})")
-            record_dmarc_event(verdict, disposition: "none",
+            record_dmarc_event(verdict, body, disposition: "none",
                                reason: "arc=pass from trusted sealer #{verdict.arc_sealer}")
           elsif verdict&.dmarc_reject?
             if SenderAuth.enforce_dmarc?
               @store.log(:info, "SMTP rejected message from <#{@mail_from}>: DMARC policy (#{auth_results}, #{peer_ip})")
-              record_dmarc_event(verdict, disposition: "reject")
+              record_dmarc_event(verdict, body, disposition: "reject")
               reply 550, "5.7.1 Rejected by DMARC policy for #{verdict.from_domain}"
               reset
               return
             end
             @store.log(:info, "SMTP would reject message from <#{@mail_from}> under DMARC enforcement (#{auth_results}, #{peer_ip})")
-            record_dmarc_event(verdict, disposition: "none", reason: "p=reject not enforced (local policy)")
+            record_dmarc_event(verdict, body, disposition: "none", reason: "p=reject not enforced (local policy)")
           elsif verdict&.temperror? && SenderAuth.enforce_dmarc? && SenderAuth.fail_closed?
             @store.log(:info, "SMTP tempfail for message from <#{@mail_from}>: DMARC temperror under enforcement (#{auth_results}, #{peer_ip})")
             reply 451, "4.7.0 Sender verification temporarily unavailable, try again later"
@@ -1265,7 +1266,7 @@ module MailOnRails
             # p=quarantine (the edge never quarantines - the mailroom's
             # junk-filing is the quarantine disposition).
             disposition = verdict.dmarc[:result] == :fail && verdict.dmarc[:policy] == :quarantine ? "quarantine" : "none"
-            record_dmarc_event(verdict, disposition: disposition)
+            record_dmarc_event(verdict, body, disposition: disposition)
           end
         end
 
@@ -1471,7 +1472,7 @@ module MailOnRails
       # reports its rua= asked for). Best-effort telemetry riding the
       # acceptance path: never changes the reply, and skipped entirely for
       # stores predating the contract method.
-      def record_dmarc_event(verdict, disposition:, reason: nil)
+      def record_dmarc_event(verdict, body, disposition:, reason: nil)
         return unless Settings[:smtp_dmarc_reports]
         return unless @store.respond_to?(:dmarc_event)
 
@@ -1479,6 +1480,12 @@ module MailOnRails
         # No published record means no rua to report to; temperror and
         # permerror carry no evaluation worth aggregating.
         return unless dmarc[:domain] && %i[pass fail].include?(dmarc[:result])
+        # A bounce of one of our own reports (null sender, quoting the
+        # report's Message-ID) is not evidence about the bouncing domain
+        # - and reporting it would earn us the same bounce again tomorrow
+        # (see AggregateReport). Other null-sender mail is reported as
+        # usual: a DSN from a domain we never wrote to is real evidence.
+        return if @mail_from.to_s.empty? && AggregateReport.references?(body)
 
         published = dmarc[:published] || {}
         spf = verdict.spf || {}

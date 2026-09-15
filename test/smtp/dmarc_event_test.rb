@@ -44,7 +44,7 @@ class DmarcEventTest < Minitest::Test
     previous ? ENV["SMTP_DMARC_ENFORCE"] = previous : ENV.delete("SMTP_DMARC_ENFORCE")
   end
 
-  def deliver_mx_message
+  def deliver_mx_message(mail_from: "sender@remote.test", raw: RAW)
     server = TCPServer.new("127.0.0.1", 0)
     client = TCPSocket.new("127.0.0.1", server.addr[1])
     session_socket = server.accept
@@ -53,10 +53,10 @@ class DmarcEventTest < Minitest::Test
     thread = Thread.new { MailOnRails::SmtpServer::Session.new(session_socket, @store, spec, nil).run }
     read_reply(client)
     command(client, "EHLO client.test")
-    command(client, "MAIL FROM:<sender@remote.test>")
+    command(client, "MAIL FROM:<#{mail_from}>")
     command(client, "RCPT TO:<#{EMAIL}>")
     command(client, "DATA")
-    client.write(RAW)
+    client.write(raw)
     reply = command(client, ".")
     command(client, "QUIT")
     reply
@@ -135,6 +135,33 @@ class DmarcEventTest < Minitest::Test
     end
 
     assert_empty @store.dmarc_events, "a domain with no DMARC record has no rua to report to"
+  end
+
+  REPORT_ID = MailOnRails::AggregateReport.message_id("dmarc", "1789344000.remote.test.1c9cc08ed6b9", "example.test")
+  BOUNCE_OF_OUR_REPORT = "From: postmaster@remote.test\r\nSubject: Undeliverable: Report Domain: remote.test\r\n" \
+                         "In-Reply-To: #{REPORT_ID}\r\nAuto-Submitted: auto-replied\r\n\r\nmailbox full\r\n"
+
+  # The loop breaker: a null-sender bounce quoting one of our own report
+  # Message-IDs is not evidence about the bouncing domain - reporting it
+  # would earn the same bounce again tomorrow.
+  def test_a_bounce_of_our_own_report_records_no_event
+    stubbing_sender_verification(verdict(result: :pass, policy: :none)) do
+      assert_match(/\A250/, deliver_mx_message(mail_from: "", raw: BOUNCE_OF_OUR_REPORT))
+    end
+
+    assert_empty @store.dmarc_events
+  end
+
+  def test_other_null_sender_mail_and_a_quoted_report_id_with_a_sender_are_still_reported
+    stubbing_sender_verification(verdict(result: :pass, policy: :none)) do
+      # A DSN about something else entirely: real evidence about remote.test.
+      assert_match(/\A250/, deliver_mx_message(mail_from: "", raw: "From: postmaster@remote.test\r\n" \
+                                                                    "Subject: Undeliverable\r\n\r\nno such user\r\n"))
+      # A human forwarding one of our reports has a sender: not a bounce.
+      assert_match(/\A250/, deliver_mx_message(raw: BOUNCE_OF_OUR_REPORT))
+    end
+
+    assert_equal 2, @store.dmarc_events.size
   end
 
   def test_opt_out_records_nothing
