@@ -154,6 +154,14 @@ module MailOnRails
         @honeypot_fired = false
         @honeypot_event_id = nil
         @data_slot = false
+        # How far the session got, for idle_reason. Sticky on purpose:
+        # reset wipes the transaction and STARTTLS wipes the greeting, but
+        # "this peer once sent MAIL FROM" has to survive both.
+        @commands_seen = 0
+        @small_talk = false
+        @starttls_done = false
+        @auth_tried = false
+        @mail_attempted = false
         reset
       end
 
@@ -169,6 +177,32 @@ module MailOnRails
       def live_info
         { user: @authenticated_as, helo: @helo_name,
           messages: @message_count, tls: @tls }
+      end
+
+      # The verbs a session can consist of without having asked for
+      # anything: a greeting, the TLS upgrade, goodbye.
+      GREETING_VERBS = %w[HELO EHLO STARTTLS QUIT].freeze
+
+      # The shape of a session that did no mail work, nil for one that did
+      # (or tried to) - read once by Server#report_closed for the store's
+      # idle accounting (the idle_auto_ban setting). Kept out of live_info:
+      # that feeds the ops picture, and a field that moves with every
+      # command would make every command a dashboard write.
+      #
+      # Trying counts as work. A login attempt is auth_auto_ban's business
+      # and a honeypot hit is protocol_auto_ban's; on the MX a MAIL FROM,
+      # even a refused one, is a sender - or another server's address
+      # verification callout, which never reaches DATA by design. On a
+      # submission listener only AUTH counts: nothing else there is open
+      # to a stranger.
+      def idle_reason
+        return nil if honeypot_fired? || @authenticated_as || @auth_tried || @message_count.positive?
+        return "silent" if @commands_seen.zero?
+        return "no_auth" if @spec[:role] == :submission
+        return nil if @mail_attempted
+        return "no_transaction" if @small_talk
+
+        @starttls_done ? "tls_only" : "greeting_only"
       end
 
       def run
@@ -339,6 +373,8 @@ module MailOnRails
 
       def handle_command(line)
         verb, arg = line.split(" ", 2)
+        @commands_seen += 1
+        @small_talk = true unless GREETING_VERBS.include?(verb&.upcase)
         case verb&.upcase
         when "HELO", "EHLO" then helo(verb, arg)
         when "STARTTLS" then starttls(arg)
@@ -508,6 +544,7 @@ module MailOnRails
         set_timeout(handshake_timeout)
         @socket = Netserv::Tls.accept(io_for(@socket), @tls_ctx)
         @tls = true
+        @starttls_done = true
         set_timeout(read_timeout)
         # RFC 3207: discard all state learned before STARTTLS, the
         # pre-handshake HELO included.
@@ -528,6 +565,9 @@ module MailOnRails
         unless @spec[:role] == :submission
           return error_reply 503, "5.5.1 AUTH not available on this listener"
         end
+        # Before the refusals below: a client set to the wrong security
+        # type is still someone trying to log in (see idle_reason).
+        @auth_tried = true
         # Counts against the error budget like any other misplaced AUTH: a
         # client hammering plaintext AUTH on 587 is a scanner, not a typo.
         return error_reply 538, "5.7.11 Encryption required for requested authentication mechanism" unless @tls
@@ -751,6 +791,7 @@ module MailOnRails
       # -- envelope ----------------------------------------------------------
 
       def mail_from(arg)
+        @mail_attempted = true # before any refusal: see idle_reason
         # RFC 5321 §3.3: a session starts with EHLO/HELO. Requiring it
         # here (STARTTLS resets @helo_name, so post-upgrade sessions must
         # re-greet, which conformant clients do) costs legitimate senders
