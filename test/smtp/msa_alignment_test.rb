@@ -71,6 +71,27 @@ class MsaAlignmentTest < Minitest::Test
     assert_match(/\A250 2\.0\.0 Ok: queued/, submit("From: #{EMAIL}\r\nSubject: hi"))
   end
 
+  # A lone CR is a line break to every downstream parser (and to the
+  # relay path's canonicalization) but was one byte to the header scan
+  # here, so "Subject: x\rFrom: ceo@victim" hid a second From: behind the
+  # Subject: alignment saw only the account's From, then the wire message
+  # went out DKIM-signed with the one the edge never validated. The lone
+  # CR must read as a line break before alignment, so both From: lines
+  # are seen and the foreign one refused.
+  def test_from_spliced_behind_a_lone_cr_is_still_held_to_alignment
+    reply = submit("Subject: x\rFrom: ceo@victim.test\r\nFrom: #{EMAIL}")
+
+    assert_match(/\A550 5\.7\.1 From address must be the authenticated account/, reply)
+    assert_empty @store.outbound_messages
+  end
+
+  def test_from_spliced_behind_a_bare_lf_is_still_held_to_alignment
+    reply = submit("Subject: x\nFrom: ceo@victim.test\r\nFrom: #{EMAIL}")
+
+    assert_match(/\A550 5\.7\.1 From address must be the authenticated account/, reply)
+    assert_empty @store.outbound_messages
+  end
+
   def test_alias_works_for_envelope_and_from_and_rides_the_queue_row
     reply = submit("From: Boss <#{ALIAS}>\r\nSubject: hi", mail_from: ALIAS)
     assert_match(/\A250 2\.0\.0 Ok: queued/, reply)

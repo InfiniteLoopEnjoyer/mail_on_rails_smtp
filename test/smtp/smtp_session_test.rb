@@ -516,7 +516,9 @@ class SmtpSessionTest < Minitest::Test
 
     # The ".\n" must be treated as content (its stuffing dot removed), not
     # as a terminator that would leave "line two" as a smuggled command.
-    assert_equal "line one\r\n\nline two\r\n", strip_received(@store.inbound_messages.last[:data])
+    # The bare LF itself is stored as CRLF: the message is canonicalized
+    # at the terminator so no downstream parser splits it differently.
+    assert_equal "line one\r\n\r\nline two\r\n", strip_received(@store.inbound_messages.last[:data])
   end
 
   def test_data_terminator_recognized_when_crlf_splits_at_chunk_cap

@@ -128,8 +128,10 @@ class SmtpSmugglingTest < Minitest::Test
 
   def test_malformed_eod_sequences_do_not_smuggle_a_second_message
     EOD_SEQUENCES.each do |name, eod|
-      @store.inbound_messages.clear
-      @store.outbound_messages.clear
+      # A fresh store per sequence: every malformed EOD canonicalizes to
+      # the same stored bytes, so a shared store would answer the second
+      # and later ones as redeliveries (same digest) and store nothing.
+      setup
       with_session do |client|
         start_data(client)
         client.write(smuggle_payload(eod))
@@ -191,6 +193,60 @@ class SmtpSmugglingTest < Minitest::Test
   end
 
   # -- outbound: stored mail must not leak unfiltered EOD on the wire ----------
+
+  # -- inbound: the stored message has one line-ending convention ------------
+
+  # The lone-CR differential: one byte to the edge's header scans, a line
+  # break to the Mail gem, the mailroom and the relay path. Canonicalized
+  # at the DATA terminator, before anything reads the message, so the
+  # stored copy carries only CRLF - never a lone CR or a bare LF for a
+  # downstream parser to split differently than the edge did.
+  def test_stored_message_carries_no_lone_cr_or_bare_lf
+    with_session do |client|
+      start_data(client)
+      client.write("Subject: hi\rX-Original-To: victim@example.test\r\n" \
+                   "From: #{SENDER}\nTo: #{EMAIL}\r\n\r\nline\rline\nline\r\n.\r\n")
+      assert_match(/\A250 /, read_reply(client))
+      command(client, "QUIT")
+    end
+
+    data = @store.inbound_messages.last[:data]
+    refute_match(/\r(?!\n)|(?<!\r)\n/, data, "stored data must be pure CRLF")
+    assert_includes data, "Subject: hi\r\nX-Original-To: victim@example.test\r\n"
+    assert_includes data, "From: #{SENDER}\r\nTo: #{EMAIL}\r\n\r\nline\r\nline\r\nline\r\n"
+  end
+
+  def test_bdat_message_carries_no_lone_cr_or_bare_lf
+    with_session do |client|
+      read_reply(client)
+      command(client, "EHLO client.test")
+      command(client, "MAIL FROM:<#{SENDER}>")
+      command(client, "RCPT TO:<#{EMAIL}>")
+      payload = "Subject: hi\rX-Original-To: victim@example.test\r\n\r\nbody\nmore\r\n"
+      client.write("BDAT #{payload.bytesize} LAST\r\n#{payload}")
+      assert_match(/\A250 /, read_reply(client))
+      command(client, "QUIT")
+    end
+
+    data = @store.inbound_messages.last[:data]
+    refute_match(/\r(?!\n)|(?<!\r)\n/, data, "stored data must be pure CRLF")
+    assert_includes data, "Subject: hi\r\nX-Original-To: victim@example.test\r\n\r\nbody\r\nmore\r\n"
+  end
+
+  # Canonical CRLF can be up to twice the wire size: a message under the
+  # cap as sent but over it once every lone CR is a CRLF is refused, not
+  # stored (the in-transfer accounting only counts raw bytes).
+  def test_message_that_outgrows_the_cap_when_canonicalized_is_refused
+    with_session(spec_extra: { max_message_bytes: 200 }) do |client|
+      start_data(client)
+      client.write("x\r" * 75 + "\r\n.\r\n") # 152 bytes on the wire, 227 canonical
+      assert_match(/\A552 5\.3\.4/, read_reply(client))
+      assert_match(/\A250 /, command(client, "NOOP"), "the session survives the refusal")
+      command(client, "QUIT")
+    end
+
+    assert_empty @store.inbound_messages
+  end
 
   def test_canonicalize_strips_nuls_and_bare_newlines
     out = MailOnRails::OutboundData.canonicalize("a\n.\n\x00.\rb")

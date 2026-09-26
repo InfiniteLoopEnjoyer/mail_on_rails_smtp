@@ -6,8 +6,10 @@ require "securerandom"
 require "mail_on_rails/settings"
 require "mail_on_rails/netserv/config"
 require "mail_on_rails/netserv/server"
+require "mail_on_rails/netserv/account_limiter"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/sender_auth"
+require "mail_on_rails/outbound_data"
 require "mail_on_rails/aggregate_report"
 require "mail_on_rails/smtp/dnsbl"
 require "mail_on_rails/smtp/fcrdns"
@@ -111,7 +113,16 @@ module MailOnRails
       @data_slots = 0
       @data_slots_lock = Mutex.new
 
+      # Concurrent authenticated sessions per account, likewise
+      # process-wide. The per-IP caps are blind to one stolen password
+      # worked from many addresses, each under its own per-IP allowance;
+      # this bounds the identity instead. Read through the settings schema
+      # per login, so a change applies to the next AUTH without a restart.
+      @account_sessions = Netserv::AccountLimiter.new(-> { Settings[:smtp_max_sessions_per_account] })
+
       class << self
+        attr_reader :account_sessions
+
         # true when a slot was taken; the caller owns its release.
         def acquire_data_slot(limit)
           @data_slots_lock.synchronize do
@@ -143,6 +154,7 @@ module MailOnRails
         @close_reason = nil
         @helo_name = nil
         @authenticated_as = nil
+        @account_session_key = nil
         @auth_attempts = 0
         @protocol_errors = 0
         @on_auth_failure = nil
@@ -240,6 +252,7 @@ module MailOnRails
         # A session that dies mid-payload (EOF, overflow, timeout) still
         # holds its DATA slot until here.
         release_data_slot
+        release_account_session
         close_socket
       end
 
@@ -312,10 +325,7 @@ module MailOnRails
         return @continuation.call(chunk) if @continuation
 
         line = line_from(chunk)
-        # Probe detection reads the raw chunk, terminated or not: a TLS
-        # ClientHello or a scanner's binary blob rarely carries a CRLF, so
-        # it arrives as an unterminated chunk that line_from blanks.
-        probe = Netserv::ProbeSignatures.detect(chunk.delete_suffix("\r\n"))
+        probe = Netserv::ProbeSignatures.detect(probe_surface(chunk, line))
         redacted = redact_for_trace(line)
         trace "<= #{redacted}"
         honeypot_transcript.inbound(redacted)
@@ -347,6 +357,47 @@ module MailOnRails
         chunk.end_with?("\r\n") ? chunk.delete_suffix("\r\n") : ""
       end
 
+      # The bytes probe detection gets to see. Normally the raw chunk,
+      # terminated or not: a TLS ClientHello or a scanner's binary blob
+      # rarely carries a CRLF, so it arrives as an unterminated chunk that
+      # line_from blanks. A MAIL FROM / RCPT TO whose argument is a
+      # well-formed <path> is the exception: RFC 5321 lets a quoted
+      # local-part hold $ ( ) { } and backticks, so "$(wget http://x)"@y
+      # is a legal (if hostile-looking) mailbox, and the relay or
+      # forwarder carrying a message to it would otherwise be recorded -
+      # or, with protocol_auto_ban, banned - for delivering it. The path
+      # is left to the address parser, whose 501/550/553 answers it on its
+      # merits; detection still covers the verb, the whitespace and any
+      # ESMTP parameters.
+      #
+      # "Well-formed" is RFC 5321 4.1.2 Mailbox syntax (Dot-string or
+      # Quoted-string local-part, Domain or address-literal, the null
+      # path, an obsolete source route), plus RFC 6531's UTF-8 octets -
+      # deliberately stricter than mail_from/rcpt_to's lenient <[^>]*>:
+      # the real Exim payloads (${run{/bin/sh -c ...}}, \x2f escapes)
+      # carry spaces, backslashes or quotes no unquoted local-part may,
+      # so they are not paths and are checked whole, as before.
+      MAIL_ATEXT = "A-Za-z0-9!#$%&'*+/=?^_`{|}~\\-\\x80-\\xff"
+      MAIL_LOCAL_PART = "(?:[#{MAIL_ATEXT}]+(?:\\.[#{MAIL_ATEXT}]+)*" \
+                        "|\"(?:[\\x20\\x21\\x23-\\x5b\\x5d-\\x7e\\x80-\\xff]|\\\\[\\x20-\\x7e])*\")"
+      MAIL_DOMAIN = "(?:[A-Za-z0-9\\x80-\\xff][A-Za-z0-9\\x80-\\xff-]*(?:\\.[A-Za-z0-9\\x80-\\xff][A-Za-z0-9\\x80-\\xff-]*)*" \
+                    "|\\[[A-Za-z0-9.:]+\\])"
+      MAIL_PATH = Regexp.new(
+        "\\A((?:FROM|TO):[\\x20\\t]*)" \
+        "<(?:(?:@#{MAIL_DOMAIN}(?:,@#{MAIL_DOMAIN})*:)?#{MAIL_LOCAL_PART}(?:@#{MAIL_DOMAIN})?)?>" \
+        "(.*)\\z",
+        Regexp::IGNORECASE | Regexp::MULTILINE | Regexp::NOENCODING
+      )
+
+      def probe_surface(chunk, line)
+        text = chunk.delete_suffix("\r\n")
+        verb, arg = line.split(" ", 2)
+        return text unless %w[MAIL RCPT].include?(verb.to_s.upcase)
+        return text unless (match = MAIL_PATH.match(arg.to_s.b))
+
+        "#{verb} #{match[1]}<>#{match[2]}"
+      end
+
       # -- protocol tracing --------------------------------------------------
       #
       # Log of the command/reply exchange, for diagnosing broken peers.
@@ -358,15 +409,27 @@ module MailOnRails
       # level (info) used to swallow the old :debug lines, making the
       # toggle a silent no-op exactly when it was needed.
 
+      # A command line is read up to its CRLF, but a bare CR or LF earlier
+      # in it survives into +message+ and would forge a second log line
+      # ("NOOP\n[mail_on_rails] SMTP auth success for ..."); flattened to
+      # the literal escape, as the IMAP session's trace does.
       def trace(message)
-        @store.log(:info, "SMTP #{message} (#{peer_ip})") if @trace
+        @store.log(:info, "SMTP #{message.gsub(/\r\n?|\n/, '\n')} (#{peer_ip})") if @trace
       end
 
       # An AUTH argument is an initial response - PLAIN's carries the
       # password, LOGIN's the username - so drop everything after the
-      # mechanism (Postal's sanitize_input_for_log).
+      # mechanism (Postal's sanitize_input_for_log). Tokenized exactly as
+      # handle_command and auth do (awk-style split: leading whitespace
+      # skipped, any ASCII whitespace separates), so a line the dispatcher
+      # accepts as AUTH - " AUTH PLAIN x", "AUTH\vPLAIN\vx" - is redacted
+      # too, rather than only the strictly-spaced spelling.
       def redact_for_trace(line)
-        line.sub(/\A(AUTH[ \t]+\S+)[ \t].*/i) { "#{Regexp.last_match(1)} #{LOG_REDACTION}" }
+        verb, rest = line.split(" ", 2)
+        return line unless verb&.casecmp?("AUTH")
+
+        mechanism, initial = rest.to_s.split(" ", 2)
+        initial ? "AUTH #{mechanism} #{LOG_REDACTION}" : line
       end
 
       # -- command dispatch --------------------------------------------------
@@ -649,12 +712,14 @@ module MailOnRails
         # Same semantics as the store-throttled branch below: temporary
         # failure, credentials never adjudicated, lockout not extended.
         if @auth_locked&.call
-          @store.log(:warn, "SMTP auth refused for #{user.to_s.empty? ? "(empty)" : user}: IP locked out (#{peer_ip})")
+          @store.log(:warn, "SMTP auth refused for #{loggable_user(user)}: IP locked out (#{peer_ip})")
           return reply 454, "4.7.0 Temporary authentication failure, try again later"
         end
 
-        result = @store.authenticate(user.to_s, pass.to_s, ip: peer_ip)
+        result = @store.authenticate(user.to_s, pass.to_s, ip: throttle_ip)
         if result[:account_id]
+          return if account_session_refusal(result[:account_id], result[:email])
+
           @authenticated_as = result[:email]
           @store.log(:info, "SMTP auth success for #{@authenticated_as} (#{peer_ip})")
           # A login against a canary can only be an attacker: record it, ban the
@@ -668,11 +733,62 @@ module MailOnRails
           # off and retries instead of treating its password as wrong. Not
           # counted as a failure anywhere - the throttle already has this
           # peer blocked.
-          @store.log(:warn, "SMTP auth throttled for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip})")
+          @store.log(:warn, "SMTP auth throttled for #{loggable_user(user)} (#{peer_ip})")
+          reply 454, "4.7.0 Temporary authentication failure, try again later"
+        elsif result[:error]
+          # The store could not adjudicate at all (database unreachable):
+          # not a wrong password, so the same 454 as the throttle and,
+          # like it, counted nowhere - otherwise a client retrying through
+          # a short outage (a phone opens several connections per refresh)
+          # would lock its own address out of submission for the lockout
+          # window. Same as the SCRAM branch and the IMAP session.
+          @store.log(:warn, "SMTP auth temporary failure for #{loggable_user(user)} (#{peer_ip}): store unreachable")
           reply 454, "4.7.0 Temporary authentication failure, try again later"
         else
           auth_failure(user)
         end
+      end
+
+      # The address the store throttles and bans against. peer_ip degrades
+      # to "?" when the socket can't answer; that is a log placeholder, not
+      # an address, and must not become a throttle key of its own (the
+      # IMAP session maps it the same way).
+      def throttle_ip
+        ip = peer_ip
+        ip == "?" ? nil : ip
+      end
+
+      # The credentials were right but the account already holds its full
+      # allowance of sessions in this process: refuse this one without
+      # counting it as an authentication failure (nothing was guessed). A
+      # 454 tells the client it hit a temporary server bound, so it
+      # retries later rather than treating the password as wrong. On
+      # success the slot is held until the session ends.
+      def account_session_refusal(account_id, email)
+        if self.class.account_sessions.acquire(account_id, limit: @spec[:max_sessions_per_account])
+          @account_session_key = account_id
+          return false
+        end
+
+        @store.log(:warn, "SMTP auth refused for #{email}: too many simultaneous sessions (#{peer_ip})")
+        reply 454, "4.7.0 Too many simultaneous sessions for this account, try again later"
+        true
+      end
+
+      def release_account_session
+        return unless @account_session_key
+
+        self.class.account_sessions.release(@account_session_key)
+        @account_session_key = nil
+      end
+
+      # A username as a log line may carry it: SASL bytes are client-chosen,
+      # so a CR/LF or control byte in one would forge a line of its own.
+      # Printable characters only, bounded, "(empty)" for none (the shape
+      # BannedIp.auto_ban_note uses).
+      def loggable_user(user)
+        text = user.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?").gsub(/[^[:graph:]]/, "?")[0, 80]
+        text.empty? ? "(empty)" : text
       end
 
       # Shared failed-attempt accounting for the store-adjudicated
@@ -680,7 +796,7 @@ module MailOnRails
       def auth_failure(user)
         @auth_attempts += 1
         @on_auth_failure&.call # recorded before the reply so the throttle can't lag the client
-        @store.log(:warn, "SMTP auth failed for #{user.to_s.empty? ? "(empty)" : user} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
+        @store.log(:warn, "SMTP auth failed for #{loggable_user(user)} (#{peer_ip}, attempt #{@auth_attempts}/#{MAX_AUTH_ATTEMPTS})")
         if @auth_attempts >= MAX_AUTH_ATTEMPTS
           reply 421, "4.7.0 Error: too many failed login attempts"
           raise IOError, "auth abuse"
@@ -726,13 +842,13 @@ module MailOnRails
         # guards new connections, and the credential lookup below hands
         # out salt/iterations - grind material - before any proof.
         if @auth_locked&.call
-          @store.log(:warn, "SMTP auth refused for #{user}: IP locked out (#{peer_ip})")
+          @store.log(:warn, "SMTP auth refused for #{loggable_user(user)}: IP locked out (#{peer_ip})")
           return reply 454, "4.7.0 Temporary authentication failure, try again later"
         end
 
-        creds = @store.scram_credentials(user, ip: peer_ip)
+        creds = @store.scram_credentials(user, ip: throttle_ip)
         if creds[:throttled]
-          @store.log(:warn, "SMTP auth throttled for #{user} (#{peer_ip})")
+          @store.log(:warn, "SMTP auth throttled for #{loggable_user(user)} (#{peer_ip})")
           return reply 454, "4.7.0 Temporary authentication failure, try again later"
         end
         if creds[:error]
@@ -766,6 +882,7 @@ module MailOnRails
           verifier = "v=#{[ Scram.server_signature(server_key, auth_message) ].pack("m0")}"
           challenge([ verifier ].pack("m0")) do |empty|
             next error_reply 501, "5.5.2 Unexpected final client response" unless empty.empty?
+            next if account_session_refusal(creds[:account_id], creds[:email])
 
             @authenticated_as = creds[:email]
             @store.log(:info, "SMTP auth success for #{@authenticated_as} (#{peer_ip}, SCRAM#{"-PLUS" if plus})")
@@ -784,7 +901,7 @@ module MailOnRails
       # failure and has to be told - otherwise SCRAM would be an
       # unthrottled way around the store's brute-force budget.
       def scram_failure(user)
-        @store.record_auth_failure(user.to_s, ip: peer_ip)
+        @store.record_auth_failure(user.to_s, ip: throttle_ip)
         auth_failure(user)
       end
 
@@ -1218,7 +1335,18 @@ module MailOnRails
       end
 
       def finish_data(body)
-        unless body.is_a?(String) # :overflow
+        # One line-ending convention before anything reads the message. A
+        # lone CR (or bare LF) is an ordinary byte to the header scanners
+        # here and in the store, but a line break to the Mail gem the
+        # mailroom parses with and to the relay path (which applies this
+        # same canonicalization). Left as-is, "Subject: x\rFrom: other@"
+        # hides a second From: from MSA alignment and "Subject: x\rX-
+        # Original-To: victim@" a routing header from the trusted-header
+        # strip - each surfacing as a real header downstream. Canonical
+        # CRLF can be up to twice the wire size, so the cap is applied
+        # again here: the in-transfer accounting only saw raw bytes.
+        body = OutboundData.canonicalize(body) if body.is_a?(String)
+        if !body.is_a?(String) || body.bytesize > max_message_bytes # :overflow, or grown past the cap
           @store.log(:warn, "SMTP message from <#{@mail_from}> refused: exceeds #{max_message_bytes} bytes (#{peer_ip})")
           reply 552, "5.3.4 Message exceeds maximum size"
           reset
@@ -1322,8 +1450,9 @@ module MailOnRails
         end
 
         # The store's idempotency key (SmtpReceipt): envelope plus the body
-        # exactly as received. Taken before our Received header, whose
-        # timestamp would differ on the redelivery it exists to catch.
+        # as received (canonicalized, which a byte-identical redelivery
+        # reproduces). Taken before our Received header, whose timestamp
+        # would differ on the redelivery it exists to catch.
         digest = message_digest(body)
 
         # Our own trace header, prepended after the loop check (so we count

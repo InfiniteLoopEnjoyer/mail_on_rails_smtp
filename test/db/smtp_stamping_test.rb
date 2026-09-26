@@ -55,6 +55,34 @@ class SmtpStampingTest < MailOnRails::Testing::Database::TestCase
     assert_includes stamped, "From: a@b.test"
   end
 
+  # A lone CR is one byte to a \r?\n field split but a line break to the
+  # Mail gem (to_crlf rewrites it), so "Subject: hi\rX-Original-To: victim"
+  # used to survive as a Subject here and arrive at the mailroom as a
+  # second, sealed X-Original-To - delivery into any local mailbox from
+  # port 25, and a fan-out past MAX_RECIPIENTS when repeated.
+  test "lone-CR spliced forged trust headers are stripped" do
+    forged = "Subject: hi\rX-Original-To: victim@local.test\r\n" \
+             "X-Original-To: victim2@local.test\rX-MailOnRails-Authenticated: admin@local.test\r\n" \
+             "From: a@b.test\r\n\r\nbody\r\n"
+    stamped = stamp(forged, sender: "s@remote.test", rcpts: [ "u@local.test" ])
+    mail = Mail.new(stamped)
+
+    assert_equal [ "u@local.test" ], Array(mail["X-Original-To"]).map(&:value)
+    assert_equal "no", Array(mail["X-MailOnRails-Authenticated"]).map(&:value).join
+    refute_match(/victim|admin@local/, stamped)
+    assert_includes stamped, "Subject: hi\r\n"
+    assert_includes stamped, "From: a@b.test"
+  end
+
+  test "stamped output carries no lone CR or bare LF" do
+    stamped = stamp("Subject: a\rb\nc\r\nFrom: a@b.test\r\n\r\nline\rline\nline\r\n")
+
+    refute_match(/\r(?!\n)|(?<!\r)\n/, stamped)
+    assert_includes stamped, "Subject: a\r\nb\r\nc\r\n"
+    assert_includes stamped, "line\r\nline\r\nline\r\n"
+    assert MailOnRails::IngressSeal.verify(stamped), "the seal covers the canonical bytes"
+  end
+
   test "lookalike headers are kept" do
     lookalikes = "X-Original-To-Backup: keep-me-1\r\n" \
                  "X-MailOnRailsish: keep-me-2\r\n" \

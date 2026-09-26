@@ -3,6 +3,7 @@
 require "mail_on_rails/store"
 require "mail_on_rails/ingress_seal"
 require "mail_on_rails/idn"
+require "mail_on_rails/outbound_data"
 
 module MailOnRails
   module Store
@@ -275,6 +276,13 @@ module MailOnRails
       # as whom), and X-MailOnRails-Client-Ip/-Helo the connection facts
       # the mailroom feeds to rspamd.
       def stamp(data, mail_from:, rcpt_to:, authenticated_as:, client_ip:, helo:)
+        # The session canonicalizes line endings before it gets here, but
+        # the strip below must not depend on its caller: a lone CR is one
+        # byte to the field scan and a line break to the Mail gem the
+        # mailroom parses with, so an un-canonicalized "Subject: x\rX-
+        # Original-To: victim" would read here as one Subject and route
+        # there as a second X-Original-To - a sealed, trusted one.
+        data = OutboundData.canonicalize(data)
         authenticated = authenticated_as.to_s.strip
         stamped = [ "Return-Path: <#{sanitize_header(mail_from)}>\r\n" ]
         stamped += Array(rcpt_to).map { |rcpt| "X-Original-To: #{sanitize_header(rcpt)}\r\n" }
