@@ -51,13 +51,14 @@ module MailOnRails
       end
 
       # The addresses an authenticated account may claim as sender: its
-      # own plus its aliases (RFC 6409 MSA authorization - the session's
-      # permitted_senders). [] for an unknown account; the session then
+      # own plus its exact aliases (RFC 6409 MSA authorization - the
+      # session's permitted_senders). Pattern aliases are receive-only and
+      # never appear here. [] for an unknown account; the session then
       # falls back to exact-account matching.
       def sender_addresses(email)
         result = db do
           account = EmailAccount.find_by(email: email.to_s.strip.downcase)
-          account ? [ account.email ] + account.email_aliases.pluck(:email) : []
+          account ? [ account.email ] + account.email_aliases.exact.pluck(:email) : []
         end
         result.is_a?(Array) ? result : []
       end
@@ -184,8 +185,12 @@ module MailOnRails
 
       private
 
+      # Exact account, exact alias, signed VERP sub-address, then pattern
+      # alias - the same order as the mailroom's resolve_account, so what
+      # RCPT accepts is exactly what delivery can route.
       def hosted_address?(address)
-        EmailAccount.exists?(email: address) || EmailAlias.exists?(email: address) || verp_address?(address)
+        EmailAccount.exists?(email: address) || EmailAlias.exact.exists?(email: address) ||
+          verp_address?(address) || EmailAlias.account_for_pattern(address).present?
       end
 
       # A signed VERP sub-address (bounce+m<id>-<mac>@<domain>) counts as
@@ -215,7 +220,7 @@ module MailOnRails
       end
 
       def resolve_account(address)
-        EmailAccount.find_by(email: address) || EmailAlias.find_by(email: address)&.email_account
+        EmailAccount.for_address(address)
       end
 
       # The Return-Path queued outbound rows carry: the envelope sender
@@ -230,7 +235,7 @@ module MailOnRails
         return candidate if candidate == account_email
 
         account = EmailAccount.find_by(email: account_email)
-        account&.email_aliases&.exists?(email: candidate) ? candidate : account_email
+        account&.email_aliases&.exact&.exists?(email: candidate) ? candidate : account_email
       end
 
       # Drops any local recipient (account or alias) that resolves to a
