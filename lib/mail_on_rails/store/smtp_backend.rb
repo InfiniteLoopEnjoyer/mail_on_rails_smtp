@@ -4,6 +4,7 @@ require "mail_on_rails/store"
 require "mail_on_rails/ingress_seal"
 require "mail_on_rails/idn"
 require "mail_on_rails/outbound_data"
+require "mail_on_rails/header_field"
 
 module MailOnRails
   module Store
@@ -37,16 +38,18 @@ module MailOnRails
     class SmtpBackend < Base
       # Headers a remote sender must not be able to forge: stripped from
       # the submitted DATA before we stamp authoritative values from the
-      # SMTP session. WSP before the colon is RFC 5322 obs-syntax the Mail
-      # gem (and so the mailroom) accepts as the same field name, so
-      # "X-Original-To : victim" must be stripped like the strict spelling.
-      TRUSTED_HEADERS = /\A(X-Original-To|X-MailOnRails-[\w-]+|Return-Path)[ \t]*:/i
+      # SMTP session. The name is matched as the most lenient reader would
+      # take it (HeaderField): the Mail gem - and so the mailroom - ends a
+      # field name with rstrip, so "X-Original-To : victim" and
+      # "X-Original-To\v: victim" are both X-Original-To there and must be
+      # stripped like the strict spelling.
+      TRUSTED_HEADERS = HeaderField.matcher("X-Original-To", "X-MailOnRails-[\\w-]+", "Return-Path", literal: false)
 
       def authenticate(email, password, ip: nil, source: "smtp")
         super
       end
 
-      def record_auth_failure(email, ip: nil, source: "smtp")
+      def record_auth_failure(email, ip: nil, source: "smtp", **options)
         super
       end
 
@@ -154,8 +157,8 @@ module MailOnRails
           stamped = stamp(data, mail_from: mail_from, rcpt_to: local,
                           authenticated_as: authenticated_as, client_ip: client_ip, helo: helo)
           # Angle brackets stripped to match what deliver_raw stores
-          # (Mail#message_id is bracketless).
-          mid = stamped[/^Message-ID:[ \t]*<([^>]*)>/i, 1].to_s.presence
+          # (Mail#message_id is bracketless, and goes through header_text).
+          mid = EmailMessage.header_text(stamped[/^Message-ID:[ \t]*<([^>]*)>/i, 1])
           accounts.each do |account|
             mailbox = account.quarantine_mailbox
             if mid && mailbox.email_messages.exists?(message_id: mid)
@@ -288,6 +291,10 @@ module MailOnRails
         # Original-To: victim" would read here as one Subject and route
         # there as a second X-Original-To - a sealed, trusted one.
         data = OutboundData.canonicalize(data)
+        # Nor on its caller putting a header first: an opening WSP line
+        # would continue the last header stamped below ("...Authenticated:
+        # no" + " admin@local" reads as an authenticated sender).
+        data.sub!(/\A(?:[ \t]+(?:\r\n)?)+/, "")
         authenticated = authenticated_as.to_s.strip
         stamped = [ "Return-Path: <#{sanitize_header(mail_from)}>\r\n" ]
         stamped += Array(rcpt_to).map { |rcpt| "X-Original-To: #{sanitize_header(rcpt)}\r\n" }

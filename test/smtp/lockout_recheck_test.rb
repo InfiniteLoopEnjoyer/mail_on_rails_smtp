@@ -108,7 +108,7 @@ class LockoutRecheckTest < Minitest::Test
     assert_match(/\A421/, late.gets("\r\n").to_s)
   end
 
-  test "the session-side refusal never extends the lockout" do
+  test "the session-side refusal spends the session's own attempts and then hangs up" do
     spec = start_server
     survivor = connect_tls(spec)
     read_reply(survivor)
@@ -119,14 +119,16 @@ class LockoutRecheckTest < Minitest::Test
     command(abuser, "EHLO client.test")
     2.times { command(abuser, "AUTH PLAIN #{auth_plain_token(ALICE, "wrong")}") }
 
-    # Refused 454s are not failures; if each one re-recorded against the
-    # throttle the lockout would extend forever. The throttle window is
-    # 900s so expiry can't be waited out here; instead assert the refusal
-    # is repeatable and stays a 454 (a recorded failure would eventually
-    # trip this session's own attempt cap with a 421).
-    3.times do
+    # Refused 454s are not failures - if each one re-recorded against the
+    # throttle the lockout would extend forever (auth_budget_test.rb pins
+    # that nothing is reported) - but each spends one of the connection's
+    # MAX_AUTH_ATTEMPTS: a locked-out peer is hung up on, not left free to
+    # pipeline AUTH for the session lifetime (2026-11-17 audit, M3).
+    (MailOnRails::SmtpServer::MAX_AUTH_ATTEMPTS - 1).times do
       assert_match(/\A454/, command(survivor, "AUTH PLAIN #{auth_plain_token(ALICE, PASSWORD)}"))
     end
-    assert_match(/\A250/, command(survivor, "NOOP"), "session must survive the refusals")
+    assert_match(/\A250/, command(survivor, "NOOP"), "session must survive the refusals within its budget")
+    assert_match(/\A421 4\.7\.0/, command(survivor, "AUTH PLAIN #{auth_plain_token(ALICE, PASSWORD)}"))
+    assert_nil survivor.gets("\r\n"), "the connection closes after the 421"
   end
 end

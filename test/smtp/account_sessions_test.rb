@@ -82,14 +82,26 @@ class SmtpAccountSessionsTest < Minitest::Test
     assert_match(/\A235/, auth(holder))
 
     client = open_session(max: 1)
-    # MAX_AUTH_ATTEMPTS failures would end the connection with 421;
-    # refusals are not failures, so the connection survives them.
-    (MailOnRails::SmtpServer::MAX_AUTH_ATTEMPTS + 1).times do
+    # A refusal is a 454, never the 535 of a wrong password, and the
+    # login goes through once a slot frees. It does spend one of the
+    # connection's MAX_AUTH_ATTEMPTS (2026-11-17 audit, M3: no AUTH
+    # outcome is free), so the retries stay within that.
+    (MailOnRails::SmtpServer::MAX_AUTH_ATTEMPTS - 1).times do
       assert_match(/\A454/, auth(client))
     end
     holder.close
     sleep 0.05
     assert_match(/\A235/, auth(client), "a dropped holder frees its slot")
+  end
+
+  def test_refusals_past_the_connection_budget_close_the_connection
+    holder = open_session(max: 1)
+    assert_match(/\A235/, auth(holder))
+
+    client = open_session(max: 1)
+    (MailOnRails::SmtpServer::MAX_AUTH_ATTEMPTS - 1).times { assert_match(/\A454/, auth(client)) }
+    assert_match(/\A421 4\.7\.0/, auth(client))
+    assert_nil client.gets("\r\n"), "the connection closes after the 421"
   end
 
   def test_refused_session_is_not_authenticated

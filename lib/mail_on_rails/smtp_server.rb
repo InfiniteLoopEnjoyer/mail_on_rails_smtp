@@ -10,6 +10,8 @@ require "mail_on_rails/netserv/account_limiter"
 require "mail_on_rails/smtp/session_helpers"
 require "mail_on_rails/sender_auth"
 require "mail_on_rails/outbound_data"
+require "mail_on_rails/header_field"
+require "mail_on_rails/netserv/bounded_reader"
 require "mail_on_rails/aggregate_report"
 require "mail_on_rails/smtp/dnsbl"
 require "mail_on_rails/smtp/fcrdns"
@@ -40,6 +42,13 @@ module MailOnRails
     # the message with our added headers, and a max-size message must not
     # blow the scanner's cap (which fails closed as a 451, forever).
     MAX_MESSAGE_BYTES = 24 * 1024 * 1024
+    # The header block alone (everything before the first empty line).
+    # Every header parser downstream - the Mail gem, IMAP ENVELOPE, the
+    # DKIM verifier - costs at least linear time in it, some far more per
+    # address, and a message is otherwise free to be 24 MB of header. No
+    # real message comes near this (Exim's own header_maxsize is 1 MB,
+    # Postfix's header_size_limit 100 kB).
+    MAX_HEADER_BYTES = 1024 * 1024
     MAX_LINE = 4096
     # RFC 5321 4.5.3.1.1 caps a domain at 255 octets; the HELO name is
     # echoed into every Received header we stamp.
@@ -145,6 +154,7 @@ module MailOnRails
 
       def initialize(socket, store, spec, tls_ctx)
         @socket = socket
+        @reader = Netserv::BoundedReader.new(socket)
         @store = store
         @spec = spec
         @tls_ctx = tls_ctx
@@ -221,7 +231,7 @@ module MailOnRails
         set_timeout(read_timeout)
         reply 220, honeypot_banner || "#{server_name} ESMTP service ready"
         quit = false
-        while (chunk = @socket.gets("\r\n", MAX_LINE))
+        while (chunk = @reader.gets("\r\n", MAX_LINE))
           if handle_chunk(chunk) == :quit
             quit = true
             break
@@ -314,9 +324,14 @@ module MailOnRails
 
       # -- input handling ----------------------------------------------------
       #
-      # The run loop above is the only read site. Each chunk is one
+      # The run loop above is the only line read site (BDAT reads its
+      # counted payload through the same reader). Each chunk is one
       # MAX_LINE-capped gets("\r\n") result: normally a full CRLF line, but
-      # an overlong line arrives split with no terminator. Multi-line states
+      # an overlong line arrives split with no terminator - on TLS too,
+      # which is why the read goes through Netserv::BoundedReader and not
+      # the socket: SSLSocket#gets applies its limit only once it has seen
+      # the terminator, so a peer that never sent one grew that buffer
+      # without bound and none of the checks below ever ran. Multi-line states
       # (DATA payload, AUTH challenge/response) install @continuation, which
       # then receives the raw chunks instead of the command dispatch and
       # clears itself when its exchange completes - Postal's @proc pattern.
@@ -532,6 +547,11 @@ module MailOnRails
         @spec[:max_message_bytes] || MAX_MESSAGE_BYTES
       end
 
+      # Same seam for the header cap.
+      def max_header_bytes
+        @spec[:max_header_bytes] || MAX_HEADER_BYTES
+      end
+
       # Same seam for the per-session message cap.
       def max_messages_per_session
         @spec[:max_messages] || MAX_MESSAGES_PER_SESSION
@@ -606,6 +626,12 @@ module MailOnRails
         # full idle window.
         set_timeout(handshake_timeout)
         @socket = Netserv::Tls.accept(io_for(@socket), @tls_ctx)
+        # A reader per socket. Nothing carries over: on the plaintext
+        # socket the old one held no buffer of its own, and whatever the
+        # peer pipelined behind STARTTLS sits in that socket's IO buffer,
+        # which the handshake (reading the descriptor directly) never
+        # sees - so cleartext cannot be replayed as post-TLS commands.
+        @reader = Netserv::BoundedReader.new(@socket)
         @tls = true
         @starttls_done = true
         set_timeout(read_timeout)
@@ -713,7 +739,7 @@ module MailOnRails
         # failure, credentials never adjudicated, lockout not extended.
         if @auth_locked&.call
           @store.log(:warn, "SMTP auth refused for #{loggable_user(user)}: IP locked out (#{peer_ip})")
-          return reply 454, "4.7.0 Temporary authentication failure, try again later"
+          return auth_deferred
         end
 
         result = @store.authenticate(user.to_s, pass.to_s, ip: throttle_ip)
@@ -732,18 +758,18 @@ module MailOnRails
           # 4954's 454, so a legitimate client with a stale password backs
           # off and retries instead of treating its password as wrong. Not
           # counted as a failure anywhere - the throttle already has this
-          # peer blocked.
+          # peer blocked - but it spends a connection attempt (auth_deferred).
           @store.log(:warn, "SMTP auth throttled for #{loggable_user(user)} (#{peer_ip})")
-          reply 454, "4.7.0 Temporary authentication failure, try again later"
+          auth_deferred
         elsif result[:error]
           # The store could not adjudicate at all (database unreachable):
           # not a wrong password, so the same 454 as the throttle and,
-          # like it, counted nowhere - otherwise a client retrying through
-          # a short outage (a phone opens several connections per refresh)
-          # would lock its own address out of submission for the lockout
-          # window. Same as the SCRAM branch and the IMAP session.
+          # like it, never a recorded failure - otherwise a client retrying
+          # through a short outage (a phone opens several connections per
+          # refresh) would lock its own address out of submission for the
+          # lockout window. Same as the SCRAM branch and the IMAP session.
           @store.log(:warn, "SMTP auth temporary failure for #{loggable_user(user)} (#{peer_ip}): store unreachable")
-          reply 454, "4.7.0 Temporary authentication failure, try again later"
+          auth_deferred
         else
           auth_failure(user)
         end
@@ -771,8 +797,28 @@ module MailOnRails
         end
 
         @store.log(:warn, "SMTP auth refused for #{email}: too many simultaneous sessions (#{peer_ip})")
-        reply 454, "4.7.0 Too many simultaneous sessions for this account, try again later"
+        auth_deferred "4.7.0 Too many simultaneous sessions for this account, try again later"
         true
+      end
+
+      # An AUTH that ended without a verdict on the credentials: the IP is
+      # locked out, the store is throttling the address or is unreachable,
+      # the account is at its session cap. Deliberately not a failure -
+      # nothing goes to the accept-side lockout (@on_auth_failure) or to
+      # the store's counters, so the lockout is never extended by its own
+      # refusals and an outage cannot lock a retrying client out. It does
+      # spend one of this connection's attempts, though, like the IMAP
+      # session's auth_throttled: answering 454 for free let one connection
+      # pipeline AUTH for the whole session lifetime, a store read and an
+      # audit row apiece. The last attempt is told 421 - still temporary,
+      # so the client keeps its password and comes back on a new connection.
+      def auth_deferred(text = "4.7.0 Temporary authentication failure, try again later")
+        @auth_attempts += 1
+        if @auth_attempts >= MAX_AUTH_ATTEMPTS
+          reply 421, "4.7.0 Too many authentication attempts on this connection, try again later"
+          raise IOError, "auth abuse"
+        end
+        reply 454, text
       end
 
       def release_account_session
@@ -843,18 +889,18 @@ module MailOnRails
         # out salt/iterations - grind material - before any proof.
         if @auth_locked&.call
           @store.log(:warn, "SMTP auth refused for #{loggable_user(user)}: IP locked out (#{peer_ip})")
-          return reply 454, "4.7.0 Temporary authentication failure, try again later"
+          return auth_deferred
         end
 
-        creds = @store.scram_credentials(user, ip: throttle_ip)
+        creds = scram_lookup(user)
         if creds[:throttled]
           @store.log(:warn, "SMTP auth throttled for #{loggable_user(user)} (#{peer_ip})")
-          return reply 454, "4.7.0 Temporary authentication failure, try again later"
+          return auth_deferred
         end
         if creds[:error]
           # :notfound is a real credential miss; anything else is the
           # store being unreachable.
-          return reply 454, "4.7.0 Temporary authentication failure, try again later" unless creds[:code] == :notfound
+          return auth_deferred unless creds[:code] == :notfound
 
           return scram_failure(user)
         end
@@ -875,9 +921,12 @@ module MailOnRails
           unless final_attrs["r"] == nonce &&
                  final_attrs["c"] == [ gs2.b + cb_data.to_s.b ].pack("m0") &&
                  Scram.valid_proof?(stored_key, auth_message, proof)
-            next scram_failure(user)
+            next scram_failure(user, creds)
           end
 
+          # The proof is the verdict: the exchange counted up front is
+          # given back here, whatever becomes of the last round trip.
+          scram_verified(creds)
           server_key = creds[:server_key_base64].unpack1("m0")
           verifier = "v=#{[ Scram.server_signature(server_key, auth_message) ].pack("m0")}"
           challenge([ verifier ].pack("m0")) do |empty|
@@ -900,9 +949,37 @@ module MailOnRails
       # checked here against verifier material, so the store never saw a
       # failure and has to be told - otherwise SCRAM would be an
       # unthrottled way around the store's brute-force budget.
-      def scram_failure(user)
-        @store.record_auth_failure(user.to_s, ip: throttle_ip)
+      #
+      # +creds+ carries the reservation when the lookup counted this
+      # exchange up front; the store then logs it without counting twice.
+      def scram_failure(user, creds = nil)
+        if (reservation = creds && creds[:reservation])
+          @store.record_auth_failure(user.to_s, ip: throttle_ip, reservation: reservation)
+        else
+          @store.record_auth_failure(user.to_s, ip: throttle_ip)
+        end
         auth_failure(user)
+      end
+
+      # The verifier lookup, counted as a failed attempt before any
+      # material is handed out when the store can take it back
+      # (record_auth_success): parallel exchanges then each see the
+      # others in the throttle's budget instead of all passing the check
+      # first, and one the client walks away from after the challenge
+      # stays counted. A store without that method (the memory store)
+      # is asked the old way.
+      def scram_lookup(user)
+        if @store.respond_to?(:record_auth_success)
+          @store.scram_credentials(user, ip: throttle_ip, reserve: true)
+        else
+          @store.scram_credentials(user, ip: throttle_ip)
+        end
+      end
+
+      def scram_verified(creds)
+        return unless creds[:reservation]
+
+        @store.record_auth_success(creds[:email], reservation: creds[:reservation])
       end
 
       # -- envelope ----------------------------------------------------------
@@ -1262,11 +1339,12 @@ module MailOnRails
       end
 
       # Reads exactly +size+ payload bytes into the transaction buffer.
-      # gets and read share the IO's buffer, so mixing them is safe.
+      # Through the reader the command lines come from: its gets and read
+      # share one buffer, so mixing them is safe.
       def read_bdat_chunk(size)
         remaining = size
         while remaining.positive?
-          chunk = @socket.read([ remaining, 65_536 ].min)
+          chunk = @reader.read([ remaining, 65_536 ].min)
           raise IOError, "connection lost mid-BDAT" if chunk.nil? || chunk.empty?
 
           @bdat[:consumed] += chunk.bytesize
@@ -1280,7 +1358,7 @@ module MailOnRails
       def discard_exactly(size)
         remaining = size
         while remaining.positive?
-          chunk = @socket.read([ remaining, 65_536 ].min)
+          chunk = @reader.read([ remaining, 65_536 ].min)
           raise IOError, "connection lost mid-BDAT" if chunk.nil? || chunk.empty?
 
           remaining -= chunk.bytesize
@@ -1365,6 +1443,30 @@ module MailOnRails
           # instant one would fingerprint the blackhole.
           sleep(rand(0.05..0.3))
           reply 250, "2.0.0 Ok: queued as #{fake_queue_id}"
+          reset
+          return
+        end
+
+        if HeaderField.block(body).bytesize > max_header_bytes
+          @store.log(:warn, "SMTP message from <#{@mail_from}> refused: header exceeds #{max_header_bytes} bytes (#{peer_ip})")
+          reply 552, "5.3.4 Message header exceeds maximum size"
+          reset
+          return
+        end
+
+        # A control byte in a header field's name. RFC 5322 names are
+        # printable ASCII, so nothing legitimate is lost - and parsers do
+        # not agree where such a name ends: the Mail gem's rstrip makes
+        # "X-Original-To\v:" an X-Original-To and "From\f:" a From, which
+        # is how a forged routing header got past the trusted-header strip
+        # and a second From past the DMARC and MSA checks. Those scanners
+        # now read names the same way (HeaderField), but the store, the
+        # relay queue and every reader after them see these bytes too;
+        # refusing here means none of them is ever shown the shape.
+        # "Name :" (space/tab, RFC 5322 obs-syntax) is untouched.
+        if HeaderField.control_in_name?(body)
+          @store.log(:warn, "SMTP rejected message from <#{@mail_from}>: control character in a header field name (#{peer_ip})")
+          reply 554, "5.6.0 Header field name contains a control character"
           reset
           return
         end
@@ -1807,6 +1909,8 @@ module MailOnRails
         ip.to_s.include?(":") ? "[IPv6:#{ip}]" : "[#{ip}]"
       end
 
+      RECEIVED = HeaderField.matcher("Received")
+
       # Postal-style mail loop detection: a message whose headers show it
       # already passed through this host more than MAX_RECEIVED_HOPS times
       # is looping between forwarders.
@@ -1814,7 +1918,7 @@ module MailOnRails
         header_section = body.split("\r\n\r\n", 2).first.to_s
         hostname = server_name.downcase
         hops = header_section.split(/\r\n(?![ \t])/).count do |header|
-          header.match?(/\AReceived:/i) && header.downcase.include?(hostname)
+          header.match?(RECEIVED) && header.downcase.include?(hostname)
         end
         hops > MAX_RECEIVED_HOPS
       end

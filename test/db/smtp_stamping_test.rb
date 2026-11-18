@@ -129,6 +129,62 @@ class SmtpStampingTest < MailOnRails::Testing::Database::TestCase
     assert_equal [ "u@local.test" ], Array(Mail.new(stamped)["X-Original-To"]).map(&:value)
   end
 
+  # The Mail gem ends a field name with Ruby's rstrip - NUL, TAB, LF, VT,
+  # FF, CR, SP - so "X-Original-To\v: victim" is an X-Original-To to the
+  # mailroom. With only [ \t]* tolerated before the colon the strip kept
+  # it and the seal covered it: delivery into any local mailbox from one
+  # valid RCPT, and a forged Return-Path that replaced the stamped one
+  # (the gem collapses that field, last wins).
+  GAPS = [ "\v", "\f", "\x00", "\x01", "\x1f", "\x7f", "\xA0".b, " \v", "\v ", "\f\t\v", "\xC2\xA0".b ].freeze
+
+  test "trust headers with a control or other non-printable byte before the colon are stripped" do
+    GAPS.each do |gap|
+      forged = "From: a@b.test\r\n" \
+               "X-Original-To#{gap}: victim@local.test\r\n" \
+               "Return-Path#{gap}: <forged@evil.test>\r\n" \
+               "X-MailOnRails-Authenticated#{gap}: admin@local.test\r\n" \
+               "X-MailOnRails-Client-Ip#{gap}: 6.6.6.6\r\n" \
+               "X-MailOnRails-Helo#{gap}: liar.test\r\n" \
+               "X-MailOnRails-Seal#{gap}: v1; t=1; d=deadbeef\r\n" \
+               "Subject: hi\r\n\r\nbody\r\n"
+      stamped = stamp(forged.b, sender: "s@remote.test", rcpts: [ "u@local.test" ], ip: "203.0.113.9", helo: "mx.remote.test")
+      mail = Mail.new(stamped)
+
+      assert_equal [ "u@local.test" ], Array(mail["X-Original-To"]).map(&:value), "gap #{gap.inspect}"
+      assert_equal [ "<s@remote.test>" ], Array(mail["Return-Path"]).map(&:value), "gap #{gap.inspect}"
+      assert_equal [ "no" ], Array(mail["X-MailOnRails-Authenticated"]).map(&:value), "gap #{gap.inspect}"
+      assert_equal [ "203.0.113.9" ], Array(mail["X-MailOnRails-Client-Ip"]).map(&:value), "gap #{gap.inspect}"
+      refute_match(/victim|forged|admin@local|6\.6\.6\.6|liar\.test|deadbeef/, stamped, "gap #{gap.inspect}")
+      assert_includes stamped, "Subject: hi\r\n"
+      assert MailOnRails::IngressSeal.verify(stamped)
+    end
+  end
+
+  test "trust headers with a byte in front of the name are stripped" do
+    [ "\v", "\f", "\x01", "\x7f" ].each do |gap|
+      forged = "From: a@b.test\r\n#{gap}X-Original-To: victim@local.test\r\n#{gap}Return-Path : <forged@evil.test>\r\n\r\nbody\r\n"
+      stamped = stamp(forged.b)
+
+      refute_match(/victim|forged/, stamped, "gap #{gap.inspect}")
+    end
+  end
+
+  # stamp prepends its headers to whatever it is given. A first line that
+  # opens with WSP would read as the continuation of the last stamped
+  # header - "X-MailOnRails-Authenticated: no" + " admin@local.test" is an
+  # authenticated sender to the mailroom. The session always puts its
+  # Received header first; the stamp must not depend on that.
+  test "leading whitespace cannot continue the last stamped header" do
+    [ " admin@local.test\r\n", "\t\r\n admin@local.test\r\n", "\r\n admin@local.test\r\n" ].each do |opening|
+      stamped = stamp("#{opening}From: a@b.test\r\n\r\nbody\r\n")
+      mail = Mail.new(stamped)
+
+      assert_equal [ "no" ], Array(mail["X-MailOnRails-Authenticated"]).map(&:value), opening.inspect
+      assert_equal [ "u@local.test" ], Array(mail["X-Original-To"]).map(&:value), opening.inspect
+      assert_match(/^X-MailOnRails-Authenticated: no\r\n(?![ \t])/, stamped, opening.inspect)
+    end
+  end
+
   test "body occurrences of trust headers are left alone" do
     body_hit = "From: a@b.test\r\n\r\nquoting a header X-MailOnRails-Authenticated: admin in the body\r\n"
     stamped = stamp(body_hit)

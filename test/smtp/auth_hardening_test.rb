@@ -9,7 +9,7 @@ require "mail_on_rails/smtp/store/memory"
 # The AUTH path's contract with the log, the transcript and the store:
 # credentials never reach the trace however the dispatcher tolerated the
 # AUTH line's whitespace, client bytes cannot forge log lines, a store
-# outage is a 454 that counts against nobody, and the "?" peer
+# outage is a 454 that is nobody's failed password, and the "?" peer
 # placeholder never reaches the store as an address.
 class SmtpAuthHardeningTest < Minitest::Test
   EMAIL = "user@example.test"
@@ -190,24 +190,23 @@ class SmtpAuthHardeningTest < Minitest::Test
 
   # -- L5: a store outage is not a wrong password -----------------------------
 
-  def test_store_error_on_plain_is_a_454_that_counts_against_nobody
+  def test_store_error_on_plain_is_a_454_that_is_nobodys_failed_password
     store = OutageStore.new(logger: Logger.new(@log))
     with_session(store: store) do |client|
       read_reply(client)
       command(client, "EHLO client.test")
-      # More attempts than MAX_AUTH_ATTEMPTS allows for failures: none of
-      # these may count, so the connection must never be dropped.
-      (MailOnRails::SmtpServer::MAX_AUTH_ATTEMPTS + 1).times do
-        assert_match(/\A454 4\.7\.0 Temporary authentication failure/, command(client, "AUTH PLAIN #{plain_token}"))
-      end
+      assert_match(/\A454 4\.7\.0 Temporary authentication failure/, command(client, "AUTH PLAIN #{plain_token}"))
       assert_match(/\A334/, command(client, "AUTH LOGIN"))
       assert_match(/\A334/, command(client, [ EMAIL ].pack("m0")))
       assert_match(/\A454 4\.7\.0/, command(client, [ PASSWORD ].pack("m0")))
       assert_match(/\A221/, command(client, "QUIT"), "the session is still open")
     end
 
+    # Not a failure to the lockout or the log - but since the 2026-11-17
+    # audit (M3) each one spends a per-connection attempt, so the outage
+    # cannot be pipelined against either (auth_budget_test.rb).
     assert_equal 0, @auth_failures, "a store error must not feed the accept-side lockout"
-    assert_equal 0, @session.instance_variable_get(:@auth_attempts), "nor the per-connection cap"
+    assert_equal 2, @session.instance_variable_get(:@auth_attempts), "each still spends a connection attempt"
     refute_includes @log.string, "auth failed"
     assert_includes @log.string, "SMTP auth temporary failure for #{EMAIL}"
   end
