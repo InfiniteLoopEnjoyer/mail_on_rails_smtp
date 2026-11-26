@@ -1768,6 +1768,12 @@ module MailOnRails
         # (see AggregateReport). Other null-sender mail is reported as
         # usual: a DSN from a domain we never wrote to is real evidence.
         return if @mail_from.to_s.empty? && AggregateReport.references?(body)
+        # Mail for our dmarc@ / tls-rpt@ mailboxes alone is another
+        # receiver's report to us. Recording it would have tonight's job
+        # report on the report, which the other side then reports on in
+        # turn: a daily exchange between two machines about no mail at
+        # all (see AggregateReport).
+        return if AggregateReport.for_report_mailboxes?(@rcpt_to)
 
         published = dmarc[:published] || {}
         spf = verdict.spf || {}

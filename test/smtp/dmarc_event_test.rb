@@ -44,7 +44,7 @@ class DmarcEventTest < Minitest::Test
     previous ? ENV["SMTP_DMARC_ENFORCE"] = previous : ENV.delete("SMTP_DMARC_ENFORCE")
   end
 
-  def deliver_mx_message(mail_from: "sender@remote.test", raw: RAW)
+  def deliver_mx_message(mail_from: "sender@remote.test", raw: RAW, rcpts: [ EMAIL ])
     server = TCPServer.new("127.0.0.1", 0)
     client = TCPSocket.new("127.0.0.1", server.addr[1])
     session_socket = server.accept
@@ -54,7 +54,7 @@ class DmarcEventTest < Minitest::Test
     read_reply(client)
     command(client, "EHLO client.test")
     command(client, "MAIL FROM:<#{mail_from}>")
-    command(client, "RCPT TO:<#{EMAIL}>")
+    rcpts.each { |rcpt| assert_match(/\A250/, command(client, "RCPT TO:<#{rcpt}>")) }
     command(client, "DATA")
     client.write(raw)
     reply = command(client, ".")
@@ -162,6 +162,32 @@ class DmarcEventTest < Minitest::Test
     end
 
     assert_equal 2, @store.dmarc_events.size
+  end
+
+  # The other loop breaker: a report from another receiver, arriving at
+  # dmarc@ or tls-rpt@, is not mail to report on - doing so has the two
+  # report generators writing to each other nightly about nothing else.
+  def test_mail_for_the_report_mailboxes_alone_records_no_event
+    @store.add_account(email: "dmarc@example.test", password: "pw-123456")
+    @store.add_account(email: "tls-rpt@example.test", password: "pw-123456")
+
+    stubbing_sender_verification(verdict(result: :pass, policy: :none)) do
+      assert_match(/\A250/, deliver_mx_message(rcpts: [ "dmarc@example.test" ]))
+      assert_match(/\A250/, deliver_mx_message(rcpts: [ "TLS-RPT@example.test" ]))
+      assert_match(/\A250/, deliver_mx_message(rcpts: [ "dmarc@example.test", "tls-rpt@example.test" ]))
+    end
+
+    assert_empty @store.dmarc_events
+  end
+
+  def test_mail_that_also_reaches_a_person_is_still_reported
+    @store.add_account(email: "dmarc@example.test", password: "pw-123456")
+
+    stubbing_sender_verification(verdict(result: :pass, policy: :none)) do
+      assert_match(/\A250/, deliver_mx_message(rcpts: [ "dmarc@example.test", EMAIL ]))
+    end
+
+    assert_equal 1, @store.dmarc_events.size
   end
 
   def test_opt_out_records_nothing
